@@ -15,6 +15,7 @@ const reviewRoutes = require("./routes/reviews");
 const messageRoutes = require("./routes/messages");
 const notificationRoutes = require("./routes/notifications");
 const financeRoutes = require("./routes/finance");
+const adRoutes = require("./routes/ads");
 
 const app = express();
 app.use(cors());
@@ -42,6 +43,7 @@ app.use("/", reviewRoutes);
 app.use("/", messageRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/", financeRoutes);
+app.use("/ads", adRoutes);
 
 app.use((err, req, res, next) => {
   // A correlation ID goes to the client so a real support conversation can
