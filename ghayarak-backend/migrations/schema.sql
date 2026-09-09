@@ -165,6 +165,13 @@ create table if not exists listings (
 create index if not exists idx_listings_category on listings(category);
 create index if not exists idx_listings_city on listings(city);
 create index if not exists idx_listings_status on listings(status);
+
+-- Added: parts weren't only for cars — trucks and motorbikes are a real,
+-- previously-invisible segment of the Libyan market. Defaults existing
+-- rows to 'car' since that's what they all were before this column
+-- existed.
+alter table listings add column if not exists vehicle_type text not null default 'car' check (vehicle_type in ('car', 'truck', 'motorbike'));
+create index if not exists idx_listings_vehicle_type on listings(vehicle_type);
 create index if not exists idx_listings_moderation on listings(moderation_status);
 create index if not exists idx_listings_seller on listings(seller_id);
 
@@ -543,29 +550,6 @@ create table if not exists revenue_events (
   ref_id text,
   created_at timestamptz not null default now()
 );
-
--- Paid advertising placements (home screen banners, etc). Self-serve
--- payment isn't wired yet (no live DPAY merchant account to test against),
--- so for now these are created directly by an admin/finance staff member
--- when an advertiser pays through a manual channel (bank transfer, cash,
--- whatever) — same honest pattern as bank_transfer_confirmations below,
--- which already handles "real money changed hands outside the app."
-create table if not exists ad_banners (
-  id uuid primary key default uuid_generate_v4(),
-  advertiser_name text not null,
-  advertiser_contact text,
-  headline text not null,
-  subtext text,
-  link_url text,
-  placement text not null default 'home_banner' check (placement in ('home_banner', 'search_results')),
-  amount_paid numeric(10,2),
-  starts_at timestamptz not null,
-  ends_at timestamptz not null,
-  status text not null default 'active' check (status in ('active', 'expired', 'rejected')),
-  created_by uuid references users(id),
-  created_at timestamptz not null default now()
-);
-create index if not exists idx_ad_banners_active on ad_banners(status, starts_at, ends_at);
 
 -- Rate limiting, DB-backed since there's no Redis in this stack yet. One
 -- row per (identifier, action) attempt; middleware counts recent rows in
