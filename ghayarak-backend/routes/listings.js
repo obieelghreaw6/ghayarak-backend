@@ -21,7 +21,7 @@ router.get("/mine", requireAuth, async (req, res) => {
 
 // GET /listings?category=&city=&q=&page=
 router.get("/", async (req, res) => {
-  const { category, city, q, page = 1 } = req.query;
+  const { category, city, q, page = 1, vehicleType } = req.query;
   const limit = 24;
   const offset = (Number(page) - 1) * limit;
 
@@ -42,6 +42,7 @@ router.get("/", async (req, res) => {
   ];
   const params = [];
   if (category) { params.push(category); conditions.push(`l.category = $${params.length}`); }
+  if (vehicleType) { params.push(vehicleType); conditions.push(`l.vehicle_type = $${params.length}`); }
   if (city) { params.push(city); conditions.push(`l.city = $${params.length}`); }
   if (q) { params.push(`%${q.toLowerCase()}%`); conditions.push(`(lower(l.title) like $${params.length} or lower(l.make) like $${params.length} or lower(l.model) like $${params.length})`); }
 
@@ -107,16 +108,19 @@ router.post(
   async (req, res) => {
     const {
       title, category, make, model, yearFrom, yearTo, price, condition,
-      city, description, protectedDeal, shopId,
+      city, description, protectedDeal, shopId, vehicleType,
     } = req.body;
     if (!title || !category || !make || !model || !price || !condition || !city) {
       return res.status(400).json({ error: "Missing required fields." });
     }
+    if (vehicleType && !["car", "truck", "motorbike"].includes(vehicleType)) {
+      return res.status(400).json({ error: "Invalid vehicle type." });
+    }
     const { rows } = await query(
       `insert into listings
-        (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, protected_deal)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *`,
-      [req.user.id, shopId || null, title, category, make, model, yearFrom, yearTo, price, condition, city, description, !!protectedDeal]
+        (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, protected_deal, vehicle_type)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *`,
+      [req.user.id, shopId || null, title, category, make, model, yearFrom, yearTo, price, condition, city, description, !!protectedDeal, vehicleType || "car"]
     );
     res.status(201).json({ listing: rows[0] });
   }
