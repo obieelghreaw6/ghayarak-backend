@@ -172,6 +172,32 @@ create index if not exists idx_listings_status on listings(status);
 -- existed.
 alter table listings add column if not exists vehicle_type text not null default 'car' check (vehicle_type in ('car', 'truck', 'motorbike'));
 create index if not exists idx_listings_vehicle_type on listings(vehicle_type);
+
+-- Image infrastructure. Images live in Cloudinary (real object storage +
+-- CDN + automatic compression/thumbnails), never in the database itself —
+-- this table just tracks ownership (who uploaded it, for safe deletion
+-- checks) and what it's attached to. `images` columns on the actual
+-- entities below store the final ordered array of {url, publicId} for
+-- display; this table is the source of truth for "can this person delete
+-- this specific image."
+create table if not exists uploads (
+  id uuid primary key default uuid_generate_v4(),
+  public_id text not null unique,
+  url text not null,
+  thumbnail_url text not null,
+  uploader_id uuid not null references users(id) on delete cascade,
+  purpose text not null check (purpose in ('listing', 'request', 'offer', 'shop_logo', 'shop_cover', 'dispute', 'profile')),
+  attached_to text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_uploads_uploader on uploads(uploader_id);
+create index if not exists idx_uploads_attached on uploads(attached_to);
+
+alter table listings add column if not exists images jsonb not null default '[]';
+alter table part_requests add column if not exists images jsonb not null default '[]';
+alter table part_offers add column if not exists images jsonb not null default '[]';
+alter table shops add column if not exists logo_url text;
+alter table shops add column if not exists cover_url text;
 create index if not exists idx_listings_moderation on listings(moderation_status);
 create index if not exists idx_listings_seller on listings(seller_id);
 
@@ -215,6 +241,13 @@ create table if not exists part_offers (
 );
 create index if not exists idx_part_offers_request on part_offers(request_id);
 
+-- Idempotency: the client sends the same client_key on every retry of the
+-- same submit attempt (not a new one each time). A real duplicate tap or
+-- an actual second offer gets a new key from the client and is allowed;
+-- a network-failure retry reuses the same one and safely collides here
+-- instead of creating a second offer.
+alter table part_offers add column if not exists client_key text;
+create unique index if not exists idx_part_offers_idempotency on part_offers(request_id, seller_id, client_key) where client_key is not null;
 -- ---------------------------------------------------------------------
 -- Escrow (Phase 2 — dormant). True platform custody of buyer funds.
 -- Do NOT activate until a licensed Libyan payment partner / e-money
