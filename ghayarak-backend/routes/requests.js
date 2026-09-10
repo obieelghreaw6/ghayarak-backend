@@ -103,7 +103,7 @@ router.post(
   requireAuth,
   rateLimit("offer_create", { max: 30, windowMinutes: 60, keyFn: (req) => req.user.id }),
   async (req, res) => {
-    const { price, condition, notes, deliveryAvailable, shopId } = req.body;
+    const { price, condition, notes, deliveryAvailable, shopId, clientKey } = req.body;
     if (!price || price <= 0 || !condition) {
       return res.status(400).json({ error: "A positive price and condition are required." });
     }
@@ -112,16 +112,41 @@ router.post(
     if (request.rows[0].status !== "open") return res.status(400).json({ error: "This request is no longer open." });
     if (request.rows[0].requester_id === req.user.id) return res.status(400).json({ error: "You can't offer on your own request." });
 
-    const { rows } = await query(
-      `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available)
-       values ($1,$2,$3,$4,$5,$6,$7) returning *`,
-      [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable]
-    );
+    let rows, isReplay = false;
+    try {
+      ({ rows } = await query(
+        `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available, client_key)
+         values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+        [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable, clientKey || null]
+      ));
+    } catch (e) {
+      // A network-failure retry sends the same clientKey as the original
+      // attempt — this unique-violation means that original attempt
+      // actually succeeded server-side even though the client never saw
+      // the response. Treat it as the same success, not a new error, so
+      // retrying never creates a second offer.
+      if (e.code === "23505" && clientKey) {
+        const existing = await query(
+          "select * from part_offers where request_id = $1 and seller_id = $2 and client_key = $3",
+          [req.params.id, req.user.id, clientKey]
+        );
+        if (existing.rows.length) {
+          rows = existing.rows;
+          isReplay = true;
+        } else {
+          throw e;
+        }
+      } else {
+        throw e;
+      }
+    }
 
-    await query(
-      "insert into notifications (user_id, type, title, body, ref_type, ref_id) values ($1,'new_offer','New offer on your request',$2,'request',$3)",
-      [request.rows[0].requester_id, `An offer of ${price} was made on your ${request.rows[0].make} ${request.rows[0].model} request`, req.params.id]
-    );
+    if (!isReplay) {
+      await query(
+        "insert into notifications (user_id, type, title, body, ref_type, ref_id) values ($1,'new_offer','New offer on your request',$2,'request',$3)",
+        [request.rows[0].requester_id, `An offer of ${price} was made on your ${request.rows[0].make} ${request.rows[0].model} request`, req.params.id]
+      );
+    }
 
     res.status(201).json({ offer: rows[0] });
   }
@@ -159,6 +184,20 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
     return res.status(400).json({ error: `Request is '${request.rows[0].status}', can't cancel.` });
   }
   const { rows } = await query("update part_requests set status = 'cancelled' where id = $1 returning *", [req.params.id]);
+
+  // Every seller who put in a real offer deserves to know it's dead, not
+  // silently find out the next time they happen to check. The frontend
+  // shows their offer as "withdrawn" by checking the parent request's
+  // status — no separate per-offer status needed, since an offer only
+  // ever exists in the context of its request.
+  const offerers = await query("select distinct seller_id from part_offers where request_id = $1", [req.params.id]);
+  for (const { seller_id } of offerers.rows) {
+    await query(
+      "insert into notifications (user_id, type, title, body, ref_type, ref_id) values ($1,'request_cancelled','Request cancelled',$2,'request',$3)",
+      [seller_id, `The ${request.rows[0].make} ${request.rows[0].model} request you offered on was cancelled by the buyer.`, req.params.id]
+    );
+  }
+
   res.json({ request: rows[0] });
 });
 
