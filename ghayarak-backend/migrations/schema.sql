@@ -333,6 +333,17 @@ create table if not exists orders (
 );
 create index if not exists idx_orders_buyer on orders(buyer_id);
 create index if not exists idx_orders_seller on orders(seller_id);
+
+-- Reserve & Pay at Shop: buyer reserves online, pays cash in person when
+-- picking up. Reuses the existing order/commission/settlement machinery
+-- rather than a parallel system — this is just a new payment_method with
+-- a short human-enterable code the shop confirms against, instead of the
+-- full accept/prepare/dispatch lifecycle.
+alter table orders drop constraint if exists orders_payment_method_check;
+alter table orders add constraint orders_payment_method_check
+  check (payment_method in ('cash', 'lypay', 'card', 'bank', 'other', 'reserve_at_shop'));
+alter table orders add column if not exists reservation_code text;
+create unique index if not exists idx_orders_reservation_code on orders(reservation_code) where reservation_code is not null;
 create index if not exists idx_orders_status on orders(status);
 create index if not exists idx_orders_listing on orders(listing_id);
 -- The application-level "does an open order already exist" check in
