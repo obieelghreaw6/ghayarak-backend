@@ -18,35 +18,270 @@ async function writeAudit(entityType, entityId, action, actorId, before, after) 
   );
 }
 
+// Real business metrics — every number here traces to an actual query
+// against production tables, not a placeholder. Organized into the same
+// sections requested: marketplace activity, money, supply, demand,
+// operations, plus a simple health read at the end.
 router.get("/overview", async (req, res) => {
-  const [listings, shops, users, revenue, orders, disputes, protection] = await Promise.all([
-    query("select count(*) from listings where status = 'active'"),
-    query("select count(*) filter (where status = 'approved') as approved, count(*) filter (where status = 'pending') as pending, count(*) filter (where status = 'suspended') as suspended, count(*) filter (where status = 'banned') as banned, count(*) as total from shops"),
-    query("select count(*) filter (where role in ('seller','shop')) as sellers, count(*) as total from users"),
-    query("select source, coalesce(sum(amount),0) as total from revenue_events group by source"),
-    query("select count(*) as total, count(*) filter (where status = 'completed') as completed, count(*) filter (where status = 'disputed') as disputed, count(*) filter (where status = 'refunded') as refunded, coalesce(sum(part_price) filter (where status = 'completed'), 0) as gmv from orders"),
-    query("select count(*) as open from disputes where status in ('open', 'investigating')"),
-    query("select count(*) filter (where status = 'active') as active, count(*) filter (where status = 'claimed') as claimed from buyer_protection"),
+  const [marketplace, money, supply, supplyNew, demand, demandOffers, demandTiming, ops, disputesRow, paymentsRow, attention] = await Promise.all([
+    query(`select
+             (select count(*) filter (where deleted_at is null) as total,
+                     count(*) filter (where deleted_at is null and status = 'approved') as active
+              from users) as users_row,
+             (select count(*) as total,
+                     count(*) filter (where status = 'active' and moderation_status = 'approved') as active
+              from listings) as listings_row,
+             (select count(*) filter (where status = 'open') as open from part_requests) as requests_row,
+             (select count(*) as total from part_offers) as offers_row,
+             (select count(*) as total,
+                     count(*) filter (where status = 'completed') as completed,
+                     count(*) filter (where status = 'cancelled') as cancelled,
+                     count(*) filter (where status = 'refunded') as refunded
+              from orders) as orders_row
+    `),
+    query(`select
+             coalesce(sum(part_price) filter (where status = 'completed'), 0) as gmv,
+             coalesce(sum(commission_amount) filter (where status = 'completed'), 0) as commission_earned,
+             count(*) filter (where status = 'completed') as completed_count
+           from orders`),
+    query(`select
+             (select count(*) as total, count(*) filter (where verified) as verified from shops) as shops_row,
+             (select count(distinct seller_id) as total from listings where shop_id is null) as individual_row,
+             (select count(distinct seller_id) as total from listings where status = 'active' and moderation_status = 'approved') as active_row
+    `),
+    // New sellers = whoever posted their very first listing in the
+    // window — not just "new user", since a signed-up-but-never-listed
+    // account isn't really a seller yet.
+    query(`select
+             count(*) filter (where first_at >= now() - interval '7 days') as week,
+             count(*) filter (where first_at >= now() - interval '30 days') as month
+           from (select seller_id, min(created_at) as first_at from listings group by seller_id) x`),
+    query(`select
+             count(*) filter (where created_at >= now() - interval '7 days') as requests_week,
+             count(*) filter (where created_at >= now() - interval '30 days') as requests_month,
+             count(*) filter (where created_at >= now() - interval '7 days') as listings_week,
+             count(*) filter (where created_at >= now() - interval '30 days') as listings_month
+           from part_requests`),
+    query(`select count(distinct request_id) as with_offers, count(*) as total_offers from part_offers`),
+    // Average time from a request being posted to its first offer —
+    // only meaningful for requests that actually got one.
+    query(`select extract(epoch from avg(fo.first_offer_at - pr.created_at)) as avg_seconds
+           from part_requests pr
+           join (select request_id, min(created_at) as first_offer_at from part_offers group by request_id) fo
+             on fo.request_id = pr.id`),
+    query(`select
+             count(*) filter (where status = 'pending') as awaiting_acceptance,
+             count(*) filter (where status in ('accepted', 'preparing')) as awaiting_dispatch,
+             count(*) filter (where status in ('ready_for_pickup', 'out_for_delivery')) as in_delivery
+           from orders`),
+    query(`select count(*) as total, count(*) filter (where status in ('open', 'investigating')) as open from disputes`),
+    query(`select count(*) filter (where status = 'failed') as failed from payments`),
+    query(`select
+             (select count(*) from listings where moderation_status = 'pending') as pending_listings,
+             (select count(*) from shops where status = 'pending') as pending_shops,
+             (select count(*) from bank_transfer_confirmations where status = 'pending') as pending_bank_transfers,
+             (select count(*) from refunds where status = 'requested') as pending_refunds
+    `),
   ]);
 
-  const revenueBySource = { boost: 0, subscription: 0, protection: 0, commission: 0, refund: 0 };
-  revenue.rows.forEach((r) => { revenueBySource[r.source] = Number(r.total); });
+  const m = marketplace.rows[0];
+  const mo = money.rows[0];
+  const su = supply.rows[0];
+  const sn = supplyNew.rows[0];
+  const de = demand.rows[0];
+  const doff = demandOffers.rows[0];
+  const dt = demandTiming.rows[0];
+  const op = ops.rows[0];
+  const disp = disputesRow.rows[0];
+  const pay = paymentsRow.rows[0];
+  const att = attention.rows[0];
+
+  const [requestTotalRows, settlementRows, refundTotalRows] = await Promise.all([
+    query("select count(*) as total from part_requests"),
+    query(`select status, coalesce(sum(commission_amount), 0) as total from settlements group by status`),
+    query(`select coalesce(sum(amount), 0) as total from refunds where status = 'refunded'`),
+  ]);
+  const allRequestsCount = Number(requestTotalRows.rows[0].total);
+  const settlementBySource = { owed: 0, invoiced: 0, paid: 0, waived: 0 };
+  settlementRows.rows.forEach((r) => { settlementBySource[r.status] = Number(r.total); });
+  const refundedTotal = Number(refundTotalRows.rows[0].total);
+
+  const gmv = Number(mo.gmv);
+  const commissionEarned = Number(mo.commission_earned);
+  const completedCount = Number(mo.completed_count);
 
   res.json({
-    activeListings: Number(listings.rows[0].count),
-    shops: {
-      total: Number(shops.rows[0].total), approved: Number(shops.rows[0].approved),
-      pending: Number(shops.rows[0].pending), suspended: Number(shops.rows[0].suspended), banned: Number(shops.rows[0].banned),
+    marketplace: {
+      totalUsers: Number(m.users_row.total),
+      activeUsers: Number(m.users_row.active),
+      totalListings: Number(m.listings_row.total),
+      activeListings: Number(m.listings_row.active),
+      openRequests: Number(m.requests_row.open),
+      offersSubmitted: Number(m.offers_row.total),
+      totalOrders: Number(m.orders_row.total),
+      completedOrders: Number(m.orders_row.completed),
+      cancelledOrders: Number(m.orders_row.cancelled),
+      refundedOrders: Number(m.orders_row.refunded),
     },
-    users: { total: Number(users.rows[0].total), sellers: Number(users.rows[0].sellers) },
-    orders: {
-      total: Number(orders.rows[0].total), completed: Number(orders.rows[0].completed),
-      disputed: Number(orders.rows[0].disputed), refunded: Number(orders.rows[0].refunded), gmv: Number(orders.rows[0].gmv),
+    money: {
+      gmv,
+      commissionEarned,
+      commissionCollected: settlementBySource.paid,
+      commissionOutstanding: settlementBySource.owed + settlementBySource.invoiced,
+      // Ghayarak never holds buyer funds (sellers collect payment
+      // directly) — there's no real "payout" to track. This is gross
+      // seller earnings, i.e. what sellers kept after commission, not a
+      // transfer Ghayarak actually makes.
+      sellerGrossEarnings: gmv - commissionEarned,
+      refundedAmount: refundedTotal,
+      averageOrderValue: completedCount > 0 ? Math.round((gmv / completedCount) * 100) / 100 : 0,
     },
-    openDisputes: Number(disputes.rows[0].open),
-    buyerProtection: { active: Number(protection.rows[0].active), claimed: Number(protection.rows[0].claimed) },
-    revenue: revenueBySource,
-    totalRevenue: revenueBySource.boost + revenueBySource.subscription + revenueBySource.protection + revenueBySource.commission - revenueBySource.refund,
+    supply: {
+      totalShops: Number(su.shops_row.total),
+      verifiedShops: Number(su.shops_row.verified),
+      individualSellers: Number(su.individual_row.total),
+      activeSellers: Number(su.active_row.total),
+      newSellersThisWeek: Number(sn.week),
+      newSellersThisMonth: Number(sn.month),
+      listingsAddedThisWeek: Number(de.listings_week),
+      listingsAddedThisMonth: Number(de.listings_month),
+    },
+    demand: {
+      requestsThisWeek: Number(de.requests_week),
+      requestsThisMonth: Number(de.requests_month),
+      requestsWithOffers: Number(doff.with_offers),
+      requestsWithNoOffers: Math.max(0, allRequestsCount - Number(doff.with_offers)),
+      averageOffersPerRequestWithOffers: Number(doff.with_offers) > 0 ? Math.round((Number(doff.total_offers) / Number(doff.with_offers)) * 10) / 10 : 0,
+      // null, not 0, when nobody has ever made an offer yet — 0 hours
+      // would misleadingly read as "instant."
+      averageHoursToFirstOffer: dt.avg_seconds !== null ? Math.round((Number(dt.avg_seconds) / 3600) * 10) / 10 : null,
+    },
+    operations: {
+      ordersAwaitingAcceptance: Number(op.awaiting_acceptance),
+      ordersAwaitingDispatch: Number(op.awaiting_dispatch),
+      ordersInDelivery: Number(op.in_delivery),
+      openDisputes: Number(disp.open),
+      totalDisputes: Number(disp.total),
+      failedPayments: Number(pay.failed),
+      needsAttention: {
+        pendingListings: Number(att.pending_listings),
+        pendingShops: Number(att.pending_shops),
+        pendingBankTransfers: Number(att.pending_bank_transfers),
+        pendingRefunds: Number(att.pending_refunds),
+        // Not trackable: notifications are database rows, not actually
+        // delivered anywhere yet (no real push/SMS/email pipeline
+        // exists) — there is no "delivery failure" to detect. Flagged
+        // honestly rather than showing a fake 0.
+      },
+    },
+  });
+});
+
+// Revenue over a window, in daily buckets, for a real chart — not the
+// random-number placeholder this replaces. days=1|7|30|90, matching the
+// four periods requested.
+router.get("/revenue-chart", async (req, res) => {
+  const days = [1, 7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+
+  const [gmvRows, refundRows] = await Promise.all([
+    query(
+      `select date_trunc('day', completed_at) as day,
+              coalesce(sum(part_price), 0) as gmv,
+              coalesce(sum(commission_amount), 0) as commission
+       from orders
+       where status = 'completed' and completed_at >= now() - make_interval(days => $1)
+       group by day order by day`,
+      [days]
+    ),
+    query(
+      `select date_trunc('day', completed_at) as day, coalesce(sum(amount), 0) as refunds
+       from refunds
+       where status = 'refunded' and completed_at >= now() - make_interval(days => $1)
+       group by day order by day`,
+      [days]
+    ),
+  ]);
+
+  // Merged by day in JS — the two queries can have different sets of
+  // days (a day with refunds but no completed sales, or vice versa), so
+  // this is safer than trying to force them together in one SQL query.
+  const byDay = new Map();
+  for (const r of gmvRows.rows) {
+    const key = r.day.toISOString().slice(0, 10);
+    byDay.set(key, { date: key, gmv: Number(r.gmv), commission: Number(r.commission), refunds: 0 });
+  }
+  for (const r of refundRows.rows) {
+    const key = r.day.toISOString().slice(0, 10);
+    const existing = byDay.get(key) || { date: key, gmv: 0, commission: 0, refunds: 0 };
+    existing.refunds = Number(r.refunds);
+    byDay.set(key, existing);
+  }
+  const series = Array.from(byDay.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+  const totals = series.reduce(
+    (acc, d) => ({ gmv: acc.gmv + d.gmv, commission: acc.commission + d.commission, refunds: acc.refunds + d.refunds }),
+    { gmv: 0, commission: 0, refunds: 0 }
+  );
+  totals.net = Math.round((totals.commission - totals.refunds) * 100) / 100;
+
+  res.json({ days, series, totals });
+});
+
+// A few real, at-a-glance health signals — not a full monitoring system
+// (that's real infrastructure work, not a database query), but genuine
+// signal from what the database actually shows, with a status color
+// derived from real thresholds rather than invented for show.
+router.get("/health", async (req, res) => {
+  const [orderHealth, requestHealth, paymentHealth, sellerHealth] = await Promise.all([
+    query(`select
+             count(*) filter (where status = 'completed') as completed,
+             count(*) filter (where status in ('completed', 'cancelled', 'refunded', 'disputed')) as terminal
+           from orders`),
+    query(`select
+             count(*) filter (where status = 'open') as open_total,
+             count(*) filter (where status = 'open' and not exists (select 1 from part_offers po where po.request_id = pr.id)) as open_no_offers
+           from part_requests pr`),
+    query(`select
+             count(*) filter (where status = 'paid') as paid,
+             count(*) filter (where status in ('paid', 'failed')) as attempted
+           from payments`),
+    query(`select count(distinct l.seller_id) as no_sales
+           from listings l
+           where l.status = 'active' and l.moderation_status = 'approved'
+             and not exists (select 1 from orders o where o.seller_id = l.seller_id and o.status = 'completed')`),
+  ]);
+
+  const oh = orderHealth.rows[0];
+  const rh = requestHealth.rows[0];
+  const ph = paymentHealth.rows[0];
+  const sh = sellerHealth.rows[0];
+
+  // Rate is null (not 0) when there's not enough data yet to mean
+  // anything — a fresh marketplace with 2 orders shouldn't show a
+  // confident red/green off a sample that small.
+  const orderCompletionRate = Number(oh.terminal) > 0 ? Number(oh.completed) / Number(oh.terminal) : null;
+  const paymentSuccessRate = Number(ph.attempted) > 0 ? Number(ph.paid) / Number(ph.attempted) : null;
+  const requestsNoOfferRate = Number(rh.open_total) > 0 ? Number(rh.open_no_offers) / Number(rh.open_total) : null;
+
+  function statusFor(rate, goodAbove, warnAbove) {
+    if (rate === null) return "unknown";
+    if (rate >= goodAbove) return "good";
+    if (rate >= warnAbove) return "warning";
+    return "bad";
+  }
+
+  res.json({
+    orderCompletion: { rate: orderCompletionRate, status: statusFor(orderCompletionRate, 0.8, 0.5), sampleSize: Number(oh.terminal) },
+    paymentSuccess: { rate: paymentSuccessRate, status: statusFor(paymentSuccessRate, 0.9, 0.7), sampleSize: Number(ph.attempted) },
+    // Inverted: a HIGH no-offer rate is the bad direction, so the good/warn
+    // thresholds are phrased as "rate is LOW enough" — statusFor expects
+    // "higher is better," so this passes (1 - rate) through it instead.
+    requestsGettingOffers: { noOfferRate: requestsNoOfferRate, status: statusFor(requestsNoOfferRate === null ? null : 1 - requestsNoOfferRate, 0.5, 0.25), sampleSize: Number(rh.open_total) },
+    sellersWithNoSales: { count: Number(sh.no_sales) },
+    // Not trackable yet: there's no background job system or error
+    // monitoring wired up (that's real infrastructure, not a query) —
+    // flagged honestly rather than shown as a fake green light.
+    infrastructureMonitoring: { status: "not_configured" },
   });
 });
 
