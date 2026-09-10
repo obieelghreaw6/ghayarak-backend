@@ -22,6 +22,20 @@ const uploadRoutes = require("./routes/uploads");
 const app = express();
 app.use(cors());
 
+// A bug in any single request's handling should never be able to take
+// the whole server down for every other user currently on the app —
+// that's a far worse outcome than one request failing. This is a
+// last-resort safety net on top of (not instead of) the normal
+// per-request error handling below; it should rarely, if ever, actually
+// fire, but if some error somehow doesn't get caught by the usual path,
+// this stops it from crashing the entire process.
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION (server stayed up):", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION (server stayed up):", err);
+});
+
 // Webhook route needs the raw body for HMAC signature verification,
 // so it's mounted with express.raw() BEFORE the global json() parser.
 app.use("/webhooks", express.raw({ type: "application/json" }), webhookRoutes);
