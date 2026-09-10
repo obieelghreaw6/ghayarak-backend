@@ -193,6 +193,15 @@ create table if not exists part_requests (
   created_at timestamptz not null default now()
 );
 
+-- Cancel/renew support: a requester can withdraw a request they no
+-- longer need, and a request that's sat open for a week without a match
+-- expires — the requester can then renew it for another 7 days rather
+-- than it just sitting stale forever.
+alter table part_requests drop constraint if exists part_requests_status_check;
+alter table part_requests add constraint part_requests_status_check
+  check (status in ('open', 'matched', 'closed', 'cancelled', 'expired'));
+alter table part_requests add column if not exists expires_at timestamptz not null default (now() + interval '7 days');
+
 create table if not exists part_offers (
   id uuid primary key default uuid_generate_v4(),
   request_id uuid not null references part_requests(id) on delete cascade,
@@ -449,6 +458,19 @@ create table if not exists messages (
 create index if not exists idx_messages_order on messages(order_id);
 create index if not exists idx_messages_listing on messages(listing_id);
 create index if not exists idx_messages_recipient on messages(recipient_id, read_at);
+
+-- Request-scoped messaging: buyer<->seller conversation about a specific
+-- part request/offer, replacing what used to just reveal a raw phone
+-- number with nothing to do afterward. Widens the scope check from
+-- "exactly one of order/listing" to "exactly one of order/listing/request".
+alter table messages add column if not exists request_id uuid references part_requests(id) on delete cascade;
+alter table messages drop constraint if exists messages_scope_check;
+alter table messages add constraint messages_scope_check check (
+  (case when order_id is not null then 1 else 0 end)
+  + (case when listing_id is not null then 1 else 0 end)
+  + (case when request_id is not null then 1 else 0 end) = 1
+);
+create index if not exists idx_messages_request on messages(request_id);
 
 -- In-app notification feed. Real push delivery (browser Push API / FCM /
 -- APNs, or SMS/WhatsApp per the "considered later" note) is a separate
