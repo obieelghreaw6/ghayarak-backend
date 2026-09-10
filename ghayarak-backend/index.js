@@ -17,6 +17,7 @@ const notificationRoutes = require("./routes/notifications");
 const financeRoutes = require("./routes/finance");
 const adRoutes = require("./routes/ads");
 const requestRoutes = require("./routes/requests");
+const uploadRoutes = require("./routes/uploads");
 
 const app = express();
 app.use(cors());
@@ -46,8 +47,16 @@ app.use("/notifications", notificationRoutes);
 app.use("/", financeRoutes);
 app.use("/ads", adRoutes);
 app.use("/requests", requestRoutes);
+app.use("/uploads", uploadRoutes);
 
 app.use((err, req, res, next) => {
+  // Multer's file-size/type errors arrive here as a normal thrown error
+  // (via patchAsyncRoutes' next(err) forwarding) — worth a clearer
+  // message than the generic 500 below, since "file too large" is
+  // something the person can actually act on.
+  if (err.name === "MulterError" || /^Only JPEG, PNG, or WebP/.test(err.message || "")) {
+    return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "Image is too large (max 8MB)." : err.message });
+  }
   // A correlation ID goes to the client so a real support conversation can
   // reference "error REQ-xxxx" without ever seeing the actual stack trace —
   // that stays server-side only, in the log line right below.
