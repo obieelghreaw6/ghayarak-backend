@@ -113,6 +113,77 @@ router.post("/listings/:listingId/messages", requireAuth, rateLimit("message_sen
   res.status(201).json({ message: rows[0] });
 });
 
+// Request-scoped thread — replaces the old "reveal a raw phone number
+// after accepting an offer, with nothing to do next" flow. Same
+// multi-party shape as listings: a request has one requester but can get
+// offers (and therefore separate conversations) from several different
+// sellers, so this needs the same "which specific other party"
+// disambiguation.
+router.get("/requests/:requestId/messages", requireAuth, async (req, res) => {
+  const request = await query("select requester_id from part_requests where id = $1", [req.params.requestId]);
+  if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
+  const requesterId = request.rows[0].requester_id;
+  const isRequester = req.user.id === requesterId;
+  const otherPartyId = isRequester ? req.query.withUserId : requesterId;
+  if (isRequester && !otherPartyId) {
+    return res.status(400).json({ error: "withUserId is required when viewing your own request's messages." });
+  }
+
+  const { rows } = await query(
+    `select * from messages where request_id = $1
+     and ((sender_id = $2 and recipient_id = $3) or (sender_id = $3 and recipient_id = $2))
+     order by created_at asc`,
+    [req.params.requestId, req.user.id, otherPartyId]
+  );
+  res.json({ messages: rows });
+});
+
+// Requester-only: which sellers have messaged them about this request
+// (e.g. to discuss an offer), so they have something to pick from before
+// opening one specific thread with ?withUserId=... above.
+router.get("/requests/:requestId/conversations", requireAuth, async (req, res) => {
+  const request = await query("select requester_id from part_requests where id = $1", [req.params.requestId]);
+  if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
+  if (request.rows[0].requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can see this." });
+
+  const { rows } = await query(
+    `select distinct on (other_user_id) other_user_id, u.name as other_user_name, m.body as last_body, m.created_at as last_at
+     from (
+       select case when sender_id = $2 then recipient_id else sender_id end as other_user_id, body, created_at
+       from messages where request_id = $1 and (sender_id = $2 or recipient_id = $2)
+     ) m
+     join users u on u.id = m.other_user_id
+     order by other_user_id, m.created_at desc`,
+    [req.params.requestId, req.user.id]
+  );
+  res.json({ conversations: rows });
+});
+
+// A request has exactly one requester, so a seller messaging always
+// implicitly means "the requester" — recipientId is only needed when the
+// requester is the one sending, since they might be talking to several
+// different sellers who each made an offer.
+router.post("/requests/:requestId/messages", requireAuth, rateLimit("message_send", { max: 30, windowMinutes: 10, keyFn: (req) => req.user.id }), async (req, res) => {
+  const { body, recipientId } = req.body;
+  if (!body?.trim()) return res.status(400).json({ error: "Message body required." });
+
+  const request = await query("select * from part_requests where id = $1", [req.params.requestId]);
+  if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
+  const r = request.rows[0];
+
+  const isRequester = req.user.id === r.requester_id;
+  const finalRecipientId = isRequester ? recipientId : r.requester_id;
+  if (!finalRecipientId) return res.status(400).json({ error: "recipientId is required when messaging as the requester." });
+  if (finalRecipientId === req.user.id) return res.status(400).json({ error: "You can't message yourself." });
+
+  const { rows } = await query(
+    "insert into messages (request_id, sender_id, recipient_id, body) values ($1,$2,$3,$4) returning *",
+    [req.params.requestId, req.user.id, finalRecipientId, body.trim()]
+  );
+  await notify(finalRecipientId, "new_message", "New message", body.trim().slice(0, 120), "request", req.params.requestId);
+  res.status(201).json({ message: rows[0] });
+});
+
 router.post("/messages/:id/read", requireAuth, async (req, res) => {
   const { rows } = await query(
     "update messages set read_at = now() where id = $1 and recipient_id = $2 and read_at is null returning *",

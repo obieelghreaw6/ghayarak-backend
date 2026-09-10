@@ -5,9 +5,40 @@ const { rateLimit } = require("../middleware/rateLimit");
 
 const router = express.Router();
 
+// There's no background job running on a schedule, so expiry is checked
+// lazily — whenever requests actually get read — rather than via real
+// cron infrastructure that isn't set up. A request nobody looks at won't
+// flip to 'expired' until the next time someone does look at it, which
+// is an acceptable approximation given the constraint, not a perfect
+// real-time system.
+async function expireDueBulk() {
+  await query("update part_requests set status = 'expired' where status = 'open' and expires_at < now()");
+}
+
 // Public — anyone can browse open requests (this is what lets a seller
 // without a matching listing still see demand and respond to it).
 router.get("/", optionalAuth, async (req, res) => {
+  await expireDueBulk();
+
+  // Best-effort: notify the requester the first time we notice one of
+  // their own requests has expired. Piggybacks on this same read rather
+  // than a real scheduled check, since there's no cron running.
+  if (req.user) {
+    try {
+      await query(
+        `insert into notifications (user_id, type, title, body, ref_type, ref_id)
+         select requester_id, 'request_expired', 'Your part request expired',
+                'Nobody made an offer in 7 days — renew it if you still need this part.', 'request', id
+         from part_requests
+         where requester_id = $1 and status = 'expired'
+           and not exists (select 1 from notifications n where n.ref_type = 'request' and n.ref_id = part_requests.id and n.type = 'request_expired')`,
+        [req.user.id]
+      );
+    } catch (e) {
+      console.error("Expiry notification insert failed (non-fatal)", e);
+    }
+  }
+
   const { status, city } = req.query;
   const conditions = ["1 = 1"];
   const params = [];
@@ -28,6 +59,10 @@ router.get("/", optionalAuth, async (req, res) => {
 });
 
 router.get("/:id", optionalAuth, async (req, res) => {
+  await query(
+    "update part_requests set status = 'expired' where id = $1 and status = 'open' and expires_at < now()",
+    [req.params.id]
+  );
   const { rows } = await query(
     `select pr.*, u.name as requester_name, u.contact as requester_contact
      from part_requests pr join users u on u.id = pr.requester_id where pr.id = $1`,
@@ -108,6 +143,37 @@ router.post("/:id/accept-offer", requireAuth, async (req, res) => {
   const { rows } = await query(
     "update part_requests set status = 'matched', accepted_offer_id = $1 where id = $2 returning *",
     [offerId, req.params.id]
+  );
+  res.json({ request: rows[0] });
+});
+
+// Requester withdraws a request they no longer need — e.g. they found
+// the part elsewhere. Only makes sense while it's still open or expired;
+// once matched or already cancelled, cancelling again doesn't mean
+// anything.
+router.post("/:id/cancel", requireAuth, async (req, res) => {
+  const request = await query("select * from part_requests where id = $1", [req.params.id]);
+  if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
+  if (request.rows[0].requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can cancel this." });
+  if (!["open", "expired"].includes(request.rows[0].status)) {
+    return res.status(400).json({ error: `Request is '${request.rows[0].status}', can't cancel.` });
+  }
+  const { rows } = await query("update part_requests set status = 'cancelled' where id = $1 returning *", [req.params.id]);
+  res.json({ request: rows[0] });
+});
+
+// Requester renews an expired (or about-to-expire) request for another 7
+// days — pushes it back to 'open' so sellers see it again.
+router.post("/:id/renew", requireAuth, async (req, res) => {
+  const request = await query("select * from part_requests where id = $1", [req.params.id]);
+  if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
+  if (request.rows[0].requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can renew this." });
+  if (!["open", "expired"].includes(request.rows[0].status)) {
+    return res.status(400).json({ error: `Request is '${request.rows[0].status}', can't renew.` });
+  }
+  const { rows } = await query(
+    "update part_requests set status = 'open', expires_at = now() + interval '7 days' where id = $1 returning *",
+    [req.params.id]
   );
   res.json({ request: rows[0] });
 });
