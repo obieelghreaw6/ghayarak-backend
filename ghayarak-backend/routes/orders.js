@@ -30,6 +30,79 @@ async function getOrderOr404(req, res) {
   return rows[0];
 }
 
+// Short, human-enterable code a seller can type in without fumbling —
+// no ambiguous characters (0/O, 1/I/l excluded), uppercase only.
+function generateReservationCode() {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return `GHY-${code}`;
+}
+
+// Shared by both the normal buyer-confirms-receipt flow and the shop
+// reserve-and-redeem flow — same financial trigger point (snapshot the
+// commission, open a settlement, invoice the seller) regardless of which
+// path got the order there. actorId is whoever's action completed it
+// (the buyer confirming, or the seller redeeming a code), for the status
+// history log.
+async function completeOrder(order, actorId) {
+  const client = await pool.connect();
+  let order_result, commissionRow, settlementRow;
+  try {
+    await client.query("BEGIN");
+    order_result = await client.query("update orders set status = 'completed', completed_at = now() where id = $1 returning *", [order.id]);
+    await logStatus(client, order.id, order.status, "completed", actorId, null);
+
+    await client.query("update listings set status = 'sold', reserved_order_id = null where id = $1", [order.listing_id]);
+
+    const commission = await client.query(
+      `insert into seller_commissions (order_id, seller_id, gross_sale_amount, commission_pct, commission_amount)
+       values ($1,$2,$3,$4,$5) returning *`,
+      [order.id, order.seller_id, order.part_price, order.commission_pct, order.commission_amount]
+    );
+    commissionRow = commission.rows[0];
+
+    const settlement = await client.query(
+      `insert into settlements (order_id, seller_commission_id, seller_id, shop_id, commission_amount, status)
+       values ($1,$2,$3,$4,$5,'owed') returning *`,
+      [order.id, commissionRow.id, order.seller_id, order.shop_id, commissionRow.commission_amount]
+    );
+    settlementRow = settlement.rows[0];
+
+    await notify(client, order.seller_id, "order_completed", "Order completed — commission due", order.id, order.id);
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  // Invoice the seller for their commission. Kept outside the
+  // transaction: a DPAY outage shouldn't roll back the completion or the
+  // settlement record — it should just leave the settlement at 'owed' for
+  // manual follow-up (see GET /admin/settlements).
+  try {
+    const seller = await query("select * from users where id = $1", [order.seller_id]);
+    const invoice = await createInvoice({
+      amount: settlementRow.commission_amount,
+      description: `Ghayarak commission — order ${order.id}`,
+      customerContact: seller.rows[0].contact,
+      metadata: { type: "commission", settlementId: settlementRow.id },
+    });
+    await query("update settlements set status = 'invoiced', dpay_invoice_id = $1 where id = $2", [invoice.id, settlementRow.id]);
+    await query(
+      "insert into payments (dpay_invoice_id, kind, ref_id, amount, status) values ($1,'commission',$2,$3,'pending')",
+      [invoice.id, settlementRow.id, settlementRow.commission_amount]
+    );
+  } catch (e) {
+    console.error("Commission invoice failed — settlement remains 'owed' for manual collection", e);
+  }
+
+  return { order: order_result.rows[0], settlement: settlementRow };
+}
+
 // GET /orders?role=buyer|seller — "My orders" or "My sales". Joins in
 // both party names and the listing title, since the UI displays these
 // directly — without this join, the frontend would only have opaque IDs
@@ -51,6 +124,23 @@ router.get("/", requireAuth, async (req, res) => {
 });
 
 const STAFF_ROLES = ["moderator", "support", "finance", "admin", "owner"];
+
+// Must come before GET /:id below — otherwise "lookup-by-code" would be
+// swallowed as an :id value. Lets a seller find the right order just
+// from the code the customer shows them in person, without already
+// knowing which order it belongs to.
+router.get("/lookup-by-code/:code", requireAuth, async (req, res) => {
+  const { rows } = await query(
+    `select o.*, l.title as listing_title, b.name as buyer_name
+     from orders o join listings l on l.id = o.listing_id join users b on b.id = o.buyer_id
+     where o.reservation_code = $1`,
+    [req.params.code.trim().toUpperCase()]
+  );
+  if (!rows.length) return res.status(404).json({ error: "No reservation found with that code." });
+  const order = rows[0];
+  if (order.seller_id !== req.user.id) return res.status(403).json({ error: "This reservation belongs to a different seller." });
+  res.json({ order });
+});
 
 router.get("/:id", requireAuth, async (req, res) => {
   const { rows } = await query(
@@ -87,16 +177,19 @@ router.get("/:id", requireAuth, async (req, res) => {
 router.post("/", requireAuth, async (req, res) => {
   const { listingId, paymentMethod, paymentMethodDetail, deliveryMethod, includeProtection, deliveryAddress, deliveryNotes } = req.body;
 
-  if (!["cash", "lypay", "card", "bank", "other"].includes(paymentMethod)) {
+  if (!["cash", "lypay", "card", "bank", "other", "reserve_at_shop"].includes(paymentMethod)) {
     return res.status(400).json({ error: "Invalid payment method." });
   }
   if (paymentMethod === "other" && !paymentMethodDetail?.trim()) {
     return res.status(400).json({ error: "Specify what payment method 'other' means." });
   }
+  if (paymentMethod === "reserve_at_shop" && deliveryMethod !== "pickup") {
+    return res.status(400).json({ error: "Reserve & Pay at Shop is pickup-only." });
+  }
   if (deliveryMethod === "delivery" && !deliveryAddress?.trim()) {
     return res.status(400).json({ error: "Delivery address is required for delivery orders." });
   }
-  const paymentCategory = paymentMethod === "cash" ? "cash" : "electronic";
+  const paymentCategory = paymentMethod === "cash" || paymentMethod === "reserve_at_shop" ? "cash" : "electronic";
 
   const { rows } = await query(
     `select l.*, u.status as seller_status, s.status as shop_status
@@ -133,6 +226,7 @@ router.post("/", requireAuth, async (req, res) => {
   // Rough placeholder estimate until real courier integration exists —
   // pickup has no transit time, delivery gets a flat 2-day estimate.
   const estimatedDeliveryAt = deliveryMethod === "delivery" ? new Date(Date.now() + 2 * 86400000) : null;
+  const reservationCode = paymentMethod === "reserve_at_shop" ? generateReservationCode() : null;
 
   const client = await pool.connect();
   try {
@@ -141,11 +235,11 @@ router.post("/", requireAuth, async (req, res) => {
       `insert into orders
         (listing_id, buyer_id, seller_id, shop_id, part_price, delivery_fee, protection_fee,
          commission_pct, commission_amount, payment_method, payment_category, payment_method_detail, delivery_method,
-         delivery_address, delivery_notes, estimated_delivery_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) returning *`,
+         delivery_address, delivery_notes, estimated_delivery_at, reservation_code)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`,
       [listingId, req.user.id, listing.seller_id, listing.shop_id, listing.price, deliveryFee, protectionFee,
        COMMISSION_PCT, commissionAmount, paymentMethod, paymentCategory, paymentMethodDetail || null, deliveryMethod,
-       deliveryAddress || null, deliveryNotes || null, estimatedDeliveryAt]
+       deliveryAddress || null, deliveryNotes || null, estimatedDeliveryAt, reservationCode]
     );
     const o = order.rows[0];
     await client.query(
@@ -165,6 +259,14 @@ router.post("/", requireAuth, async (req, res) => {
     // / network-retry race actually getting caught — turn it into the same
     // friendly 409 the app-level check above returns, instead of a raw 500.
     if (e.code === "23505") {
+      // The reservation code collision is a genuinely different situation
+      // from a duplicate order — vanishingly rare (1-in-a-billion-ish
+      // character space) but distinguished by constraint name so the
+      // error message is actually accurate rather than assuming the more
+      // common case.
+      if (e.constraint === "idx_orders_reservation_code") {
+        return res.status(409).json({ error: "Couldn't generate a unique reservation code — please try again." });
+      }
       const dup = await query(
         `select id from orders where listing_id = $1 and buyer_id = $2 and status = any($3) order by created_at desc limit 1`,
         [listingId, req.user.id, OPEN_STATUSES]
@@ -319,61 +421,29 @@ router.post("/:id/confirm", requireAuth, async (req, res) => {
   if (order.buyer_id !== req.user.id) return res.status(403).json({ error: "Only the buyer can confirm receipt." });
   if (!["delivered", "collected"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}', can't confirm.` });
 
-  const client = await pool.connect();
-  let order_result, commissionRow, settlementRow;
-  try {
-    await client.query("BEGIN");
-    order_result = await client.query("update orders set status = 'completed', completed_at = now() where id = $1 returning *", [req.params.id]);
-    await logStatus(client, req.params.id, order.status, "completed", req.user.id, null);
+  const result = await completeOrder(order, req.user.id);
+  res.json(result);
+});
 
-    await client.query("update listings set status = 'sold', reserved_order_id = null where id = $1", [order.listing_id]);
+// Reserve & Pay at Shop: the seller redeems the buyer's code in person,
+// at the moment of handover, instead of the buyer separately confirming
+// receipt afterward — the code check itself IS the confirmation, since
+// both parties are physically present for the handover and cash payment.
+// Completes the order directly from 'pending', skipping the normal
+// multi-stage accept/prepare/dispatch lifecycle that doesn't apply here.
+router.post("/:id/redeem-code", requireAuth, async (req, res) => {
+  const { code } = req.body;
+  if (!code?.trim()) return res.status(400).json({ error: "Reservation code is required." });
 
-    const commission = await client.query(
-      `insert into seller_commissions (order_id, seller_id, gross_sale_amount, commission_pct, commission_amount)
-       values ($1,$2,$3,$4,$5) returning *`,
-      [order.id, order.seller_id, order.part_price, order.commission_pct, order.commission_amount]
-    );
-    commissionRow = commission.rows[0];
+  const order = await getOrderOr404(req, res);
+  if (!order) return;
+  if (order.seller_id !== req.user.id) return res.status(403).json({ error: "Only the seller can redeem this code." });
+  if (order.payment_method !== "reserve_at_shop") return res.status(400).json({ error: "This order isn't a shop reservation." });
+  if (!["pending", "accepted"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}', can't redeem.` });
+  if (order.reservation_code !== code.trim().toUpperCase()) return res.status(400).json({ error: "That code doesn't match this order." });
 
-    const settlement = await client.query(
-      `insert into settlements (order_id, seller_commission_id, seller_id, shop_id, commission_amount, status)
-       values ($1,$2,$3,$4,$5,'owed') returning *`,
-      [order.id, commissionRow.id, order.seller_id, order.shop_id, commissionRow.commission_amount]
-    );
-    settlementRow = settlement.rows[0];
-
-    await notify(client, order.seller_id, "order_completed", "Order completed — commission due", order.id, order.id);
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
-
-  // Invoice the seller for their commission. Kept outside the transaction:
-  // a DPAY outage shouldn't roll back the buyer's confirmation or the
-  // settlement record — it should just leave the settlement at 'owed' for
-  // manual follow-up (see GET /admin/settlements).
-  try {
-    const seller = await query("select * from users where id = $1", [order.seller_id]);
-    const invoice = await createInvoice({
-      amount: settlementRow.commission_amount,
-      description: `Ghayarak commission — order ${order.id}`,
-      customerContact: seller.rows[0].contact,
-      metadata: { type: "commission", settlementId: settlementRow.id },
-    });
-    await query("update settlements set status = 'invoiced', dpay_invoice_id = $1 where id = $2", [invoice.id, settlementRow.id]);
-    await query(
-      "insert into payments (dpay_invoice_id, kind, ref_id, amount, status) values ($1,'commission',$2,$3,'pending')",
-      [invoice.id, settlementRow.id, settlementRow.commission_amount]
-    );
-  } catch (e) {
-    console.error("Commission invoice failed — settlement remains 'owed' for manual collection", e);
-  }
-
-  res.json({ order: order_result.rows[0], settlement: settlementRow });
+  const result = await completeOrder(order, req.user.id);
+  res.json(result);
 });
 
 router.post("/:id/dispute", requireAuth, async (req, res) => {
