@@ -23,32 +23,31 @@ async function writeAudit(entityType, entityId, action, actorId, before, after) 
 // sections requested: marketplace activity, money, supply, demand,
 // operations, plus a simple health read at the end.
 router.get("/overview", async (req, res) => {
-  const [marketplace, money, supply, supplyNew, demand, demandOffers, demandTiming, ops, disputesRow, paymentsRow, attention] = await Promise.all([
-    query(`select
-             (select count(*) filter (where deleted_at is null) as total,
-                     count(*) filter (where deleted_at is null and status = 'approved') as active
-              from users) as users_row,
-             (select count(*) as total,
-                     count(*) filter (where status = 'active' and moderation_status = 'approved') as active
-              from listings) as listings_row,
-             (select count(*) filter (where status = 'open') as open from part_requests) as requests_row,
-             (select count(*) as total from part_offers) as offers_row,
-             (select count(*) as total,
-                     count(*) filter (where status = 'completed') as completed,
-                     count(*) filter (where status = 'cancelled') as cancelled,
-                     count(*) filter (where status = 'refunded') as refunded
-              from orders) as orders_row
-    `),
+  const [
+    usersRow, listingsRow, requestsRow, offersRow, ordersRow,
+    money,
+    shopsRow, individualRow, activeSellersRow, supplyNew,
+    demand, demandOffers, demandTiming,
+    ops, disputesRow, paymentsRow, attention,
+  ] = await Promise.all([
+    // Each of these is deliberately its own flat top-level query rather
+    // than nested subqueries bundled into one row — a scalar subquery in
+    // a SELECT list can only return a single column, and several of
+    // these need more than one (total + active, etc). Splitting them out
+    // is the same safe pattern used everywhere else in this file.
+    query(`select count(*) filter (where deleted_at is null) as total, count(*) filter (where deleted_at is null and status = 'approved') as active from users`),
+    query(`select count(*) as total, count(*) filter (where status = 'active' and moderation_status = 'approved') as active from listings`),
+    query(`select count(*) filter (where status = 'open') as open from part_requests`),
+    query(`select count(*) as total from part_offers`),
+    query(`select count(*) as total, count(*) filter (where status = 'completed') as completed, count(*) filter (where status = 'cancelled') as cancelled, count(*) filter (where status = 'refunded') as refunded from orders`),
     query(`select
              coalesce(sum(part_price) filter (where status = 'completed'), 0) as gmv,
              coalesce(sum(commission_amount) filter (where status = 'completed'), 0) as commission_earned,
              count(*) filter (where status = 'completed') as completed_count
            from orders`),
-    query(`select
-             (select count(*) as total, count(*) filter (where verified) as verified from shops) as shops_row,
-             (select count(distinct seller_id) as total from listings where shop_id is null) as individual_row,
-             (select count(distinct seller_id) as total from listings where status = 'active' and moderation_status = 'approved') as active_row
-    `),
+    query(`select count(*) as total, count(*) filter (where verified) as verified from shops`),
+    query(`select count(distinct seller_id) as total from listings where shop_id is null`),
+    query(`select count(distinct seller_id) as total from listings where status = 'active' and moderation_status = 'approved'`),
     // New sellers = whoever posted their very first listing in the
     // window — not just "new user", since a signed-up-but-never-listed
     // account isn't really a seller yet.
@@ -84,9 +83,12 @@ router.get("/overview", async (req, res) => {
     `),
   ]);
 
-  const m = marketplace.rows[0];
+  const m = {
+    users_row: usersRow.rows[0], listings_row: listingsRow.rows[0],
+    requests_row: requestsRow.rows[0], offers_row: offersRow.rows[0], orders_row: ordersRow.rows[0],
+  };
   const mo = money.rows[0];
-  const su = supply.rows[0];
+  const su = { shops_row: shopsRow.rows[0], individual_row: individualRow.rows[0], active_row: activeSellersRow.rows[0] };
   const sn = supplyNew.rows[0];
   const de = demand.rows[0];
   const doff = demandOffers.rows[0];
