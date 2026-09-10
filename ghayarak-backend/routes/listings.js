@@ -108,7 +108,7 @@ router.post(
   async (req, res) => {
     const {
       title, category, make, model, yearFrom, yearTo, price, condition,
-      city, description, protectedDeal, shopId, vehicleType,
+      city, description, protectedDeal, shopId, vehicleType, images,
     } = req.body;
     if (!title || !category || !make || !model || !price || !condition || !city) {
       return res.status(400).json({ error: "Missing required fields." });
@@ -118,9 +118,9 @@ router.post(
     }
     const { rows } = await query(
       `insert into listings
-        (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, protected_deal, vehicle_type)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *`,
-      [req.user.id, shopId || null, title, category, make, model, yearFrom, yearTo, price, condition, city, description, !!protectedDeal, vehicleType || "car"]
+        (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, protected_deal, vehicle_type, images)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`,
+      [req.user.id, shopId || null, title, category, make, model, yearFrom, yearTo, price, condition, city, description, !!protectedDeal, vehicleType || "car", JSON.stringify(images || [])]
     );
     res.status(201).json({ listing: rows[0] });
   }
@@ -139,6 +139,54 @@ router.patch("/:id", requireAuth, async (req, res) => {
   }
   const updated = await query("update listings set status = $1 where id = $2 returning *", [status, req.params.id]);
   res.json({ listing: updated.rows[0] });
+});
+
+// Real listing editing. Two tiers, deliberately different consequences:
+//
+// Safe fields — price, description, city, protectedDeal, images — never
+// touched a buyer's trust in what the part actually IS, so these go live
+// immediately with no re-review.
+//
+// Sensitive fields — make, model, year, category, condition, authenticity,
+// partNumber — describe the actual item. Changing any of these means an
+// admin already approved a DIFFERENT claim than what's showing now, so
+// the listing drops back to pending moderation and disappears from public
+// search until re-approved — exactly the same as a brand new listing.
+const SAFE_FIELDS = ["price", "description", "city", "protectedDeal", "images"];
+const SENSITIVE_FIELDS = ["make", "model", "yearFrom", "yearTo", "category", "condition", "authenticity", "partNumber"];
+const FIELD_TO_COLUMN = {
+  price: "price", description: "description", city: "city", protectedDeal: "protected_deal", images: "images",
+  make: "make", model: "model", yearFrom: "year_from", yearTo: "year_to", category: "category",
+  condition: "condition", authenticity: "authenticity", partNumber: "part_number",
+};
+
+router.put("/:id", requireAuth, async (req, res) => {
+  const existing = await query("select * from listings where id = $1", [req.params.id]);
+  if (!existing.rows.length) return res.status(404).json({ error: "Listing not found." });
+  if (existing.rows[0].seller_id !== req.user.id) return res.status(403).json({ error: "Not your listing." });
+
+  const providedFields = Object.keys(req.body).filter((k) => SAFE_FIELDS.includes(k) || SENSITIVE_FIELDS.includes(k));
+  if (providedFields.length === 0) return res.status(400).json({ error: "No editable fields provided." });
+
+  const touchesSensitive = providedFields.some((f) => SENSITIVE_FIELDS.includes(f));
+
+  const setClauses = [];
+  const params = [];
+  for (const field of providedFields) {
+    params.push(field === "images" ? JSON.stringify(req.body[field]) : req.body[field]);
+    setClauses.push(`${FIELD_TO_COLUMN[field]} = $${params.length}`);
+  }
+  if (touchesSensitive) {
+    setClauses.push("moderation_status = 'pending'");
+    setClauses.push("moderation_note = null");
+  }
+  params.push(req.params.id);
+
+  const { rows } = await query(
+    `update listings set ${setClauses.join(", ")} where id = $${params.length} returning *`,
+    params
+  );
+  res.json({ listing: rows[0], needsReapproval: touchesSensitive });
 });
 
 // Start a boost payment — returns a DPAY hosted checkout URL.
