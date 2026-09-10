@@ -10,6 +10,11 @@ const router = express.Router();
 router.use(requireAuth, requireRole("admin", "owner", "moderator", "support", "finance"));
 const financeOnly = requireRole("finance", "admin", "owner");
 const moderationOnly = requireRole("moderator", "admin", "owner");
+// Permanent deletion is more destructive than approving/rejecting or
+// marking something settled — deliberately excludes moderator, who can
+// hide a listing via the existing moderation actions but shouldn't be
+// able to permanently erase data.
+const adminOnly = requireRole("admin", "owner");
 
 async function writeAudit(entityType, entityId, action, actorId, before, after) {
   await query(
@@ -396,6 +401,20 @@ router.post("/shops/:id/verify", moderationOnly, async (req, res) => {
   res.json({ shop: rows[0] });
 });
 
+// Permanent deletion. Unlike listings, this never blocks on real order
+// history — every table referencing a shop does so with "on delete set
+// null" (the shop disappears, its past listings/orders just lose the
+// shop association rather than being destroyed), so this is always safe
+// to run.
+router.delete("/shops/:id", adminOnly, async (req, res) => {
+  const before = await query("select * from shops where id = $1", [req.params.id]);
+  if (!before.rows.length) return res.status(404).json({ error: "Shop not found." });
+
+  await query("delete from shops where id = $1", [req.params.id]);
+  await writeAudit("shop", req.params.id, "deleted_by_admin", req.user.id, before.rows[0], null);
+  res.json({ ok: true });
+});
+
 // ---------------------------------------------------------------------
 // Listing moderation
 // ---------------------------------------------------------------------
@@ -431,6 +450,41 @@ router.post("/listings/:id/remove", moderationOnly, async (req, res) => {
   const { rows } = await query("update listings set status = 'removed' where id = $1 returning *", [req.params.id]);
   await writeAudit("listing", req.params.id, "removed_by_admin", req.user.id, before.rows[0], rows[0]);
   res.json({ listing: rows[0] });
+});
+
+// Every listing regardless of status — the public /listings endpoint
+// deliberately only shows active+approved ones, which means an admin
+// trying to manage something pending, rejected, sold, or already removed
+// previously had no way to even see it, let alone act on it.
+router.get("/listings", async (req, res) => {
+  const { rows } = await query(
+    `select l.*, u.name as seller_name, u.contact as seller_contact, s.name as shop_name
+     from listings l join users u on u.id = l.seller_id left join shops s on s.id = l.shop_id
+     order by l.created_at desc`
+  );
+  res.json({ listings: rows });
+});
+
+// Permanent deletion — actually removes the row, not just hides it.
+// Deliberately refuses (rather than crashing) when the listing has real
+// order history attached: that history must never disappear along with
+// it. Use the remove/moderate actions above for anything with a real
+// transaction behind it; this is for listings that should never have
+// existed at all — test data, policy violations with no real activity.
+router.delete("/listings/:id", adminOnly, async (req, res) => {
+  const before = await query("select * from listings where id = $1", [req.params.id]);
+  if (!before.rows.length) return res.status(404).json({ error: "Listing not found." });
+
+  try {
+    await query("delete from listings where id = $1", [req.params.id]);
+  } catch (e) {
+    if (e.code === "23503") {
+      return res.status(409).json({ error: "This listing has real order history and can't be permanently deleted — use Remove instead to hide it." });
+    }
+    throw e;
+  }
+  await writeAudit("listing", req.params.id, "deleted_by_admin", req.user.id, before.rows[0], null);
+  res.json({ ok: true });
 });
 
 router.get("/listings", async (req, res) => {
