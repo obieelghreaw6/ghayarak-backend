@@ -31,7 +31,7 @@ router.get("/", optionalAuth, async (req, res) => {
                 'Nobody made an offer in 7 days — renew it if you still need this part.', 'request', id
          from part_requests
          where requester_id = $1 and status = 'expired'
-           and not exists (select 1 from notifications n where n.ref_type = 'request' and n.ref_id = part_requests.id and n.type = 'request_expired')`,
+           and not exists (select 1 from notifications n where n.ref_type = 'request' and n.ref_id = part_requests.id::text and n.type = 'request_expired')`,
         [req.user.id]
       );
     } catch (e) {
