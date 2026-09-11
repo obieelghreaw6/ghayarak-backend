@@ -539,6 +539,18 @@ create table if not exists notifications (
 );
 create index if not exists idx_notifications_user on notifications(user_id, read_at);
 
+-- Part-request notification types added after the table was first
+-- created — the code was already using these, but the constraint never
+-- caught up, so every one of these inserts was silently failing.
+alter table notifications drop constraint if exists notifications_type_check;
+alter table notifications add constraint notifications_type_check check (type in (
+  'order_accepted', 'order_preparing', 'order_dispatched', 'order_delivered', 'order_completed',
+  'order_cancelled', 'dispute_update', 'request_response', 'new_order', 'matching_request',
+  'new_message', 'settlement_due', 'listing_approved', 'listing_rejected',
+  'new_dispute', 'suspicious_seller', 'large_transaction', 'failed_payment', 'commission_overdue',
+  'new_offer', 'request_cancelled', 'request_expired'
+));
+
 create table if not exists payments (
   id uuid primary key default uuid_generate_v4(),
   dpay_invoice_id text unique not null,
