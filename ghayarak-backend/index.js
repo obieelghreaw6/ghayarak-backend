@@ -68,7 +68,7 @@ app.use((err, req, res, next) => {
   // (via patchAsyncRoutes' next(err) forwarding) — worth a clearer
   // message than the generic 500 below, since "file too large" is
   // something the person can actually act on.
-  if (err.name === "MulterError" || /^Only JPEG, PNG, or WebP/.test(err.message || "")) {
+  if (err.name === "MulterError" || /^Only JPEG, PNG, WebP, or HEIC/.test(err.message || "")) {
     return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "Image is too large (max 8MB)." : err.message });
   }
   // A correlation ID goes to the client so a real support conversation can
