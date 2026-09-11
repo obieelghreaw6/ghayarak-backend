@@ -7,7 +7,12 @@ const { cloudinary } = require("../lib/cloudinary");
 
 const router = express.Router();
 
-const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+// iPhones save camera photos as HEIC/HEIF by default, not JPEG — without
+// allowing these, a photo picked straight from Camera Roll gets silently
+// rejected here. Cloudinary transcodes them to a normal web format
+// automatically (same fetch_format: "auto" setting already used below),
+// so there's no need to convert anything before it reaches Cloudinary.
+const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // 8MB — generous for a phone photo, not so large someone on a weak connection is stuck forever
 const MAX_FILES_PER_REQUEST = 10;
 const ALLOWED_PURPOSES = ["listing", "request", "offer", "shop_logo", "shop_cover", "dispute", "profile"];
@@ -20,7 +25,7 @@ const upload = multer({
   limits: { fileSize: MAX_FILE_BYTES, files: MAX_FILES_PER_REQUEST },
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_TYPES.includes(file.mimetype)) {
-      return cb(new Error("Only JPEG, PNG, or WebP images are allowed."));
+      return cb(new Error("Only JPEG, PNG, WebP, or HEIC images are allowed."));
     }
     cb(null, true);
   },
