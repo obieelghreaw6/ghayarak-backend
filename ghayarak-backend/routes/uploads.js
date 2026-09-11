@@ -33,20 +33,26 @@ const upload = multer({
 
 function uploadBufferToCloudinary(buffer, folder) {
   return new Promise((resolve, reject) => {
+    // Deliberately no quality/fetch_format here — passing those as
+    // upload-time options was causing a genuine Cloudinary signature
+    // bug (the SDK folded them into an implicit "transformation" string
+    // that didn't match what was actually signed). Optimization happens
+    // at delivery time instead, via displayUrl()/thumbnailUrl() below —
+    // the exact same safe approach the thumbnail already used
+    // successfully, just now applied to the main image too.
     const stream = cloudinary.uploader.upload_stream(
-      {
-        folder: `ghayarak/${folder}`,
-        // Cloudinary picks the best format/quality automatically (e.g.
-        // serving WebP/AVIF to browsers that support it) — this is the
-        // actual "image compression" requirement, handled by Cloudinary
-        // rather than hand-rolled compression code here.
-        quality: "auto",
-        fetch_format: "auto",
-      },
+      { folder: `ghayarak/${folder}` },
       (err, result) => (err ? reject(err) : resolve(result))
     );
     stream.end(buffer);
   });
+}
+
+// Cloudinary picks the best format/quality automatically (e.g. serving
+// WebP/AVIF to browsers that support it) — applied here, at delivery
+// time via a URL parameter, not at upload time.
+function displayUrl(publicId) {
+  return cloudinary.url(publicId, { quality: "auto", fetch_format: "auto" });
 }
 
 // A thumbnail doesn't need a second upload — Cloudinary can transform any
@@ -83,7 +89,7 @@ router.post(
         const { rows } = await query(
           `insert into uploads (public_id, url, thumbnail_url, uploader_id, purpose)
            values ($1,$2,$3,$4,$5) returning *`,
-          [cloudinaryResult.public_id, cloudinaryResult.secure_url, thumbnailUrl(cloudinaryResult.public_id), req.user.id, purpose]
+          [cloudinaryResult.public_id, displayUrl(cloudinaryResult.public_id), thumbnailUrl(cloudinaryResult.public_id), req.user.id, purpose]
         );
         const row = rows[0];
         results.push({ id: row.id, publicId: row.public_id, url: row.url, thumbnailUrl: row.thumbnail_url });
