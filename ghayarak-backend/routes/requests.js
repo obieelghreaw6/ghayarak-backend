@@ -92,7 +92,34 @@ router.post(
        values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
       [req.user.id, make, model, year || null, partDescription, conditionPreference || null, city, urgency || "flexible"]
     );
-    res.status(201).json({ request: rows[0] });
+    const request = rows[0];
+
+    // Real demand alert: any seller with an active, approved listing for
+    // this same make gets notified immediately, not just whenever they
+    // happen to open Seller Center. Matched on make only (a clean,
+    // structured field on both sides) rather than category — the
+    // category-inference logic that exists for browsing is a fuzzy,
+    // free-text heuristic that only lives in the frontend today, not
+    // something to silently duplicate server-side for something that
+    // actually pages someone.
+    try {
+      const matchingSellers = await query(
+        `select distinct seller_id from listings
+         where status = 'active' and moderation_status = 'approved'
+           and lower(make) = lower($1) and seller_id != $2`,
+        [make, req.user.id]
+      );
+      for (const { seller_id } of matchingSellers.rows) {
+        await query(
+          "insert into notifications (user_id, type, title, body, ref_type, ref_id) values ($1,'matching_request','New demand for what you sell',$2,'request',$3)",
+          [seller_id, `Someone in ${city} is looking for a ${make} ${model} part: ${partDescription.slice(0, 80)}`, request.id]
+        );
+      }
+    } catch (e) {
+      console.error("Demand-alert notification insert failed (non-fatal — request itself still created)", e);
+    }
+
+    res.status(201).json({ request });
   }
 );
 
