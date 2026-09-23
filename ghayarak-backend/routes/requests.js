@@ -1,9 +1,13 @@
 const express = require("express");
-const { query } = require("../db");
+const { pool, query } = require("../db");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 
 const router = express.Router();
+// Matches the same constant in orders.js — a genuine sale happening
+// through the request/offer path earns Ghayarak the same commission as
+// any other order.
+const COMMISSION_PCT = 5.0;
 
 // There's no background job running on a schedule, so expiry is checked
 // lazily — whenever requests actually get read — rather than via real
@@ -130,21 +134,38 @@ router.post(
   requireAuth,
   rateLimit("offer_create", { max: 30, windowMinutes: 60, keyFn: (req) => req.user.id }),
   async (req, res) => {
-    const { price, condition, notes, deliveryAvailable, shopId, clientKey } = req.body;
+    const { price, condition, notes, deliveryAvailable, shopId, clientKey, canSource, sourcingDays } = req.body;
     if (!price || price <= 0 || !condition) {
       return res.status(400).json({ error: "A positive price and condition are required." });
+    }
+    if (canSource && (!sourcingDays || sourcingDays <= 0)) {
+      return res.status(400).json({ error: "Specify how many days it would take to source this part." });
     }
     const request = await query("select * from part_requests where id = $1", [req.params.id]);
     if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
     if (request.rows[0].status !== "open") return res.status(400).json({ error: "This request is no longer open." });
     if (request.rows[0].requester_id === req.user.id) return res.status(400).json({ error: "You can't offer on your own request." });
+    // Same rule as listing creation: suspension blocks NEW offers, not
+    // access to the app itself.
+    if (req.user.status !== "approved") {
+      return res.status(403).json({ error: "Your account is currently suspended and can't submit new offers." });
+    }
+    if (shopId) {
+      const shop = await query("select status, suspended_until from shops where id = $1", [shopId]);
+      if (!shop.rows.length) return res.status(404).json({ error: "Shop not found." });
+      const s = shop.rows[0];
+      const shopSuspended = s.status === "suspended" && (!s.suspended_until || new Date(s.suspended_until) > new Date());
+      if (s.status === "banned" || shopSuspended) {
+        return res.status(403).json({ error: "This shop is currently suspended and can't submit new offers." });
+      }
+    }
 
     let rows, isReplay = false;
     try {
       ({ rows } = await query(
-        `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available, client_key)
-         values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
-        [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable, clientKey || null]
+        `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available, client_key, can_source, sourcing_days)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+        [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable, clientKey || null, !!canSource, canSource ? sourcingDays : null]
       ));
     } catch (e) {
       // A network-failure retry sends the same clientKey as the original
@@ -183,20 +204,87 @@ router.post(
 // order automatically; the requester still goes through the normal buy
 // flow against the seller directly (a request/offer is a match-making
 // tool, not a transaction itself).
+// Requester accepts an offer — closes the request. This is the fix for
+// the real gap it used to have: a real order gets created here, with
+// real commission tracking, not just a status flag with nothing behind
+// it. Idempotent two ways: an already-'matched' request short-circuits
+// to returning the existing order (the common retry case), and the
+// unique index on orders.request_id is the final guard against a
+// genuine simultaneous double-tap slipping past that check.
 router.post("/:id/accept-offer", requireAuth, async (req, res) => {
   const { offerId } = req.body;
   const request = await query("select * from part_requests where id = $1", [req.params.id]);
   if (!request.rows.length) return res.status(404).json({ error: "Request not found." });
   if (request.rows[0].requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can accept an offer." });
 
+  if (request.rows[0].status === "matched") {
+    const existingOrder = await query("select * from orders where request_id = $1", [req.params.id]);
+    return res.json({ request: request.rows[0], order: existingOrder.rows[0] || null });
+  }
+  if (request.rows[0].status !== "open") {
+    return res.status(400).json({ error: `Request is '${request.rows[0].status}', can't accept an offer.` });
+  }
+
   const offer = await query("select * from part_offers where id = $1 and request_id = $2", [offerId, req.params.id]);
   if (!offer.rows.length) return res.status(404).json({ error: "Offer not found." });
+  const o = offer.rows[0];
 
-  const { rows } = await query(
-    "update part_requests set status = 'matched', accepted_offer_id = $1 where id = $2 returning *",
-    [offerId, req.params.id]
-  );
-  res.json({ request: rows[0] });
+  const commissionAmount = Math.round(Number(o.price) * (COMMISSION_PCT / 100) * 100) / 100;
+  // Never silently treated as in-stock: a sourcing offer starts its own
+  // distinct status, well before the normal fulfilment lifecycle begins.
+  const startStatus = o.can_source ? "sourcing" : "pending";
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    let orderRow;
+    try {
+      const inserted = await client.query(
+        `insert into orders
+          (request_id, offer_id, buyer_id, seller_id, shop_id, part_price, commission_pct, commission_amount,
+           payment_method, payment_category, delivery_method, status)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,'cash','cash','pickup',$9) returning *`,
+        [req.params.id, offerId, req.user.id, o.seller_id, o.shop_id, o.price, COMMISSION_PCT, commissionAmount, startStatus]
+      );
+      orderRow = inserted.rows[0];
+    } catch (e) {
+      if (e.code === "23505") {
+        await client.query("ROLLBACK");
+        const existing = await query("select * from orders where request_id = $1", [req.params.id]);
+        return res.json({ request: request.rows[0], order: existing.rows[0] });
+      }
+      throw e;
+    }
+
+    await client.query(
+      "update part_requests set status = 'matched', accepted_offer_id = $1 where id = $2",
+      [offerId, req.params.id]
+    );
+    const updatedRequest = await client.query("select * from part_requests where id = $1", [req.params.id]);
+
+    await client.query(
+      "insert into order_status_history (order_id, from_status, to_status, changed_by, note) values ($1,null,$2,$3,$4)",
+      [orderRow.id, startStatus, req.user.id, o.can_source ? "Order created from an accepted sourcing offer" : "Order created from an accepted offer"]
+    );
+
+    await client.query(
+      "insert into notifications (user_id, type, title, body, ref_type, ref_id) values ($1,'request_response',$2,$3,'order',$4)",
+      [
+        o.seller_id,
+        o.can_source ? "Sourcing confirmed by buyer" : "Your offer was accepted",
+        o.can_source ? `Order ${orderRow.id} — go get it, then confirm sourcing in the app.` : `Order ${orderRow.id} is ready for you to accept.`,
+        orderRow.id,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.json({ request: updatedRequest.rows[0], order: orderRow });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 });
 
 // Requester withdraws a request they no longer need — e.g. they found
