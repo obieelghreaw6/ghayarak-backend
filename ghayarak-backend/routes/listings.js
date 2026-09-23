@@ -116,6 +116,22 @@ router.post(
     if (vehicleType && !["car", "truck", "motorbike"].includes(vehicleType)) {
       return res.status(400).json({ error: "Invalid vehicle type." });
     }
+    // Suspension blocks NEW listings specifically — req.user.status
+    // already reflects a lapsed temporary suspension as 'approved' (see
+    // requireAuth), so this only fires for a suspension actually still
+    // in effect right now.
+    if (req.user.status !== "approved") {
+      return res.status(403).json({ error: "Your account is currently suspended and can't create new listings." });
+    }
+    if (shopId) {
+      const shop = await query("select status, suspended_until from shops where id = $1", [shopId]);
+      if (!shop.rows.length) return res.status(404).json({ error: "Shop not found." });
+      const s = shop.rows[0];
+      const shopSuspended = s.status === "suspended" && (!s.suspended_until || new Date(s.suspended_until) > new Date());
+      if (s.status === "banned" || shopSuspended) {
+        return res.status(403).json({ error: "This shop is currently suspended and can't create new listings." });
+      }
+    }
     const { rows } = await query(
       `insert into listings
         (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, protected_deal, vehicle_type, images)
