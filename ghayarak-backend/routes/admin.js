@@ -355,14 +355,23 @@ router.get("/sellers/:type/:id", async (req, res) => {
 
 router.post("/sellers/:type/:id/status", moderationOnly, async (req, res) => {
   const { type, id } = req.params;
-  const { status, reason } = req.body; // status: approved | suspended | banned | pending
+  const { status, reason, suspendedUntil } = req.body; // status: approved | suspended | banned | pending
   if (!["shop", "individual"].includes(type)) return res.status(400).json({ error: "Invalid seller type." });
+  // A suspension or ban with no reason on record is exactly the kind of
+  // action that needs to be accountable later — reinstating someone
+  // doesn't need one, taking action against them does.
+  if (["suspended", "banned"].includes(status) && !reason?.trim()) {
+    return res.status(400).json({ error: "A reason is required to suspend or ban." });
+  }
 
   if (type === "shop") {
     if (!["pending", "approved", "suspended", "banned"].includes(status)) return res.status(400).json({ error: "Invalid status." });
     const before = await query("select * from shops where id = $1", [id]);
     if (!before.rows.length) return res.status(404).json({ error: "Shop not found." });
-    const { rows } = await query("update shops set status = $1, status_reason = $2 where id = $3 returning *", [status, reason || null, id]);
+    const { rows } = await query(
+      "update shops set status = $1, status_reason = $2, suspended_until = $3 where id = $4 returning *",
+      [status, reason || null, status === "suspended" ? suspendedUntil || null : null, id]
+    );
     await writeAudit("shop", id, `status_${status}`, req.user.id, before.rows[0], rows[0]);
     return res.json({ shop: rows[0] });
   }
@@ -370,7 +379,10 @@ router.post("/sellers/:type/:id/status", moderationOnly, async (req, res) => {
   if (!["approved", "suspended", "banned"].includes(status)) return res.status(400).json({ error: "Invalid status." });
   const before = await query("select * from users where id = $1", [id]);
   if (!before.rows.length) return res.status(404).json({ error: "Seller not found." });
-  const { rows } = await query("update users set status = $1 where id = $2 returning *", [status, id]);
+  const { rows } = await query(
+    "update users set status = $1, status_reason = $2, suspended_until = $3 where id = $4 returning *",
+    [status, reason || null, status === "suspended" ? suspendedUntil || null : null, id]
+  );
   await writeAudit("user", id, `status_${status}`, req.user.id, before.rows[0], rows[0]);
   res.json({ user: rows[0] });
 });
@@ -550,11 +562,12 @@ router.get("/disputes/:id", async (req, res) => {
 
   const [order, events, protection] = await Promise.all([
     query(
-      `select o.*, l.title as listing_title,
+      `select o.*, coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
               buyer.name as buyer_name, buyer.contact as buyer_contact,
               seller.name as seller_name, seller.contact as seller_contact
        from orders o
-       join listings l on l.id = o.listing_id
+       left join listings l on l.id = o.listing_id
+       left join part_requests pr on pr.id = o.request_id
        join users buyer on buyer.id = o.buyer_id
        join users seller on seller.id = o.seller_id
        where o.id = $1`,
@@ -780,13 +793,18 @@ router.get("/transactions", financeOnly, async (req, res) => {
 
   const where = conditions.length ? `where ${conditions.join(" and ")}` : "";
   const { rows } = await query(
-    `select o.*, l.title as listing_title,
+    `select o.*, coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
             buyer.name as buyer_name, buyer.contact as buyer_contact,
-            seller.name as seller_name, seller.contact as seller_contact
+            seller.name as seller_name, seller.contact as seller_contact,
+            stl.status as settlement_status, stl.commission_amount as settlement_commission_amount,
+            ref.status as refund_status, ref.amount as refund_amount
      from orders o
-     join listings l on l.id = o.listing_id
+     left join listings l on l.id = o.listing_id
+     left join part_requests pr on pr.id = o.request_id
      join users buyer on buyer.id = o.buyer_id
      join users seller on seller.id = o.seller_id
+     left join settlements stl on stl.order_id = o.id
+     left join refunds ref on ref.order_id = o.id
      ${where}
      order by o.created_at desc limit 200`,
     params
