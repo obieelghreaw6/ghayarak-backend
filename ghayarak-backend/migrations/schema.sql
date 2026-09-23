@@ -241,6 +241,12 @@ create table if not exists part_offers (
 );
 create index if not exists idx_part_offers_request on part_offers(request_id);
 
+-- "I can source this" — a seller can respond to a request even without
+-- current stock. Distinct from a normal in-stock offer so the buyer
+-- knows what they're actually choosing between.
+alter table part_offers add column if not exists can_source boolean not null default false;
+alter table part_offers add column if not exists sourcing_days integer;
+
 -- Idempotency: the client sends the same client_key on every retry of the
 -- same submit attempt (not a new one each time). A real duplicate tap or
 -- an actual second offer gets a new key from the client and is allowed;
@@ -333,6 +339,43 @@ create table if not exists orders (
 );
 create index if not exists idx_orders_buyer on orders(buyer_id);
 create index if not exists idx_orders_seller on orders(seller_id);
+
+-- Seller/shop suspension: temporary or permanent. suspended_until is null
+-- for a permanent suspension; set to a real timestamp for a temporary
+-- one, checked at enforcement time (listing/offer creation, receiving
+-- new orders) rather than auto-flipped back by a scheduled job that
+-- doesn't exist — the same lazy-check pattern already used for request
+-- expiry. status_reason already existed on shops; users never had it.
+alter table users add column if not exists status_reason text;
+alter table users add column if not exists suspended_until timestamptz;
+alter table shops add column if not exists suspended_until timestamptz;
+
+-- Request/offer → real order integration. An order must now come from
+-- exactly one origin: a listing purchase, or an accepted request offer —
+-- never both, never neither. This is what actually closes the gap where
+-- accepting an offer only changed a status flag with no real transaction,
+-- no commission, and no audit trail behind it.
+alter table orders alter column listing_id drop not null;
+alter table orders add column if not exists request_id uuid references part_requests(id) on delete set null;
+alter table orders add column if not exists offer_id uuid references part_offers(id) on delete set null;
+alter table orders drop constraint if exists orders_origin_check;
+alter table orders add constraint orders_origin_check check (
+  (listing_id is not null and request_id is null) or (listing_id is null and request_id is not null)
+);
+-- One order per request, ever — the actual idempotency guard. A
+-- double-tap or a network-retry on accept-offer collides here instead of
+-- creating a second order, second commission, second settlement.
+create unique index if not exists idx_orders_request_unique on orders(request_id) where request_id is not null;
+
+-- 'sourcing': a real, distinct order state for "I can source this"
+-- offers — never silently treated as in-stock and ready. The order sits
+-- here until the seller explicitly confirms they've actually obtained
+-- the part, only then entering the normal fulfilment lifecycle.
+alter table orders drop constraint if exists orders_status_check;
+alter table orders add constraint orders_status_check check (status in (
+  'sourcing', 'pending', 'accepted', 'preparing', 'ready_for_pickup', 'out_for_delivery',
+  'collected', 'delivered', 'completed', 'disputed', 'cancelled', 'refunded'
+));
 
 -- Reserve & Pay at Shop: buyer reserves online, pays cash in person when
 -- picking up. Reuses the existing order/commission/settlement machinery
@@ -480,6 +523,10 @@ create table if not exists dispute_events (
   created_at timestamptz not null default now()
 );
 create index if not exists idx_dispute_events_dispute on dispute_events(dispute_id);
+
+-- Evidence: the buyer's photos submitted when filing, so an admin isn't
+-- just guessing between two people's word against each other.
+alter table disputes add column if not exists images jsonb not null default '[]';
 
 -- Messages are deliberately scoped to an order (never a free-floating DM),
 -- so every conversation has an audit trail attached to a real transaction
