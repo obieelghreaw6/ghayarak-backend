@@ -53,7 +53,33 @@ async function completeOrder(order, actorId) {
     order_result = await client.query("update orders set status = 'completed', completed_at = now() where id = $1 returning *", [order.id]);
     await logStatus(client, order.id, order.status, "completed", actorId, null);
 
-    await client.query("update listings set status = 'sold', reserved_order_id = null where id = $1", [order.listing_id]);
+    // Request-based orders have no listing at all — only update one when
+    // there actually is one.
+    if (order.listing_id) {
+      await client.query("update listings set status = 'sold', reserved_order_id = null where id = $1", [order.listing_id]);
+
+      // The real fix for a genuine double-booking/double-fulfilment risk:
+      // /accept already cancels sibling pending orders, but a Reserve &
+      // Pay at Shop redemption can complete an order directly from
+      // 'pending' without ever going through /accept — so without this,
+      // a second buyer's still-open order (and still-valid, unredeemed
+      // code) on the same now-sold listing would remain live. Cancel
+      // every other still-open order on this listing the moment any one
+      // of them actually completes, regardless of which path got there.
+      const siblings = await client.query(
+        "select id, status from orders where listing_id = $1 and status in ('pending', 'accepted', 'preparing') and id <> $2",
+        [order.listing_id, order.id]
+      );
+      for (const s of siblings.rows) {
+        await client.query(
+          "update orders set status = 'cancelled', cancelled_at = now(), cancelled_by = 'seller', cancel_reason = 'listing_sold_elsewhere' where id = $1",
+          [s.id]
+        );
+        await logStatus(client, s.id, s.status, "cancelled", actorId, "Listing already sold through a different order");
+        const sibling = await client.query("select buyer_id from orders where id = $1", [s.id]);
+        await notify(client, sibling.rows[0].buyer_id, "order_cancelled", "Order cancelled", "This listing was sold through a different order.", s.id);
+      }
+    }
 
     const commission = await client.query(
       `insert into seller_commissions (order_id, seller_id, gross_sale_amount, commission_pct, commission_amount)
@@ -111,10 +137,13 @@ router.get("/", requireAuth, async (req, res) => {
   const { role = "buyer" } = req.query;
   const column = role === "seller" ? "seller_id" : "buyer_id";
   const { rows } = await query(
-    `select o.*, l.title as listing_title, b.name as buyer_name, b.contact as buyer_contact,
+    `select o.*,
+            coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
+            b.name as buyer_name, b.contact as buyer_contact,
             s.name as seller_name, s.contact as seller_contact
      from orders o
-     join listings l on l.id = o.listing_id
+     left join listings l on l.id = o.listing_id
+     left join part_requests pr on pr.id = o.request_id
      join users b on b.id = o.buyer_id
      join users s on s.id = o.seller_id
      where o.${column} = $1 order by o.created_at desc`,
@@ -142,12 +171,41 @@ router.get("/lookup-by-code/:code", requireAuth, async (req, res) => {
   res.json({ order });
 });
 
+// Public trust data — a real completion rate and response time, not a
+// single star rating with nothing behind it. No auth needed: this is
+// exactly the kind of thing a buyer should be able to check before
+// deciding to buy, not something locked behind logging in first.
+router.get("/seller-stats/:sellerId", async (req, res) => {
+  const { rows } = await query(
+    `select
+       count(*) filter (where status = 'completed') as completed,
+       count(*) filter (where status in ('completed', 'cancelled', 'disputed')) as terminal,
+       extract(epoch from avg(accepted_at - created_at)) filter (where accepted_at is not null) as avg_response_seconds
+     from orders where seller_id = $1`,
+    [req.params.sellerId]
+  );
+  const r = rows[0];
+  const terminal = Number(r.terminal);
+  res.json({
+    completedTransactions: Number(r.completed),
+    // null (not 0%) when there's not enough history to mean anything —
+    // a brand-new seller's first order shouldn't show as "0% completion."
+    completionRate: terminal > 0 ? Math.round((Number(r.completed) / terminal) * 100) : null,
+    averageResponseHours: r.avg_response_seconds !== null ? Math.round((Number(r.avg_response_seconds) / 3600) * 10) / 10 : null,
+  });
+});
+
 router.get("/:id", requireAuth, async (req, res) => {
   const { rows } = await query(
-    `select o.*, l.title as listing_title, b.name as buyer_name, b.contact as buyer_contact,
+    `select o.*,
+            coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
+            po.can_source, po.sourcing_days,
+            b.name as buyer_name, b.contact as buyer_contact,
             s.name as seller_name, s.contact as seller_contact
      from orders o
-     join listings l on l.id = o.listing_id
+     left join listings l on l.id = o.listing_id
+     left join part_requests pr on pr.id = o.request_id
+     left join part_offers po on po.id = o.offer_id
      join users b on b.id = o.buyer_id
      join users s on s.id = o.seller_id
      where o.id = $1`,
@@ -192,7 +250,11 @@ router.post("/", requireAuth, async (req, res) => {
   const paymentCategory = paymentMethod === "cash" || paymentMethod === "reserve_at_shop" ? "cash" : "electronic";
 
   const { rows } = await query(
-    `select l.*, u.status as seller_status, s.status as shop_status
+    `select l.*,
+            case when u.status = 'suspended' and u.suspended_until is not null and u.suspended_until <= now()
+                 then 'approved' else u.status end as seller_status,
+            case when s.status = 'suspended' and s.suspended_until is not null and s.suspended_until <= now()
+                 then 'approved' else s.status end as shop_status
      from listings l join users u on u.id = l.seller_id left join shops s on s.id = l.shop_id
      where l.id = $1 and l.status = 'active' and l.moderation_status = 'approved'`,
     [listingId]
@@ -293,18 +355,24 @@ router.post("/:id/accept", requireAuth, async (req, res) => {
     const updated = await client.query("update orders set status = 'accepted', accepted_at = now() where id = $1 returning *", [req.params.id]);
     await logStatus(client, req.params.id, "pending", "accepted", req.user.id, null);
 
-    await client.query("update listings set status = 'reserved', reserved_order_id = $1 where id = $2", [req.params.id, order.listing_id]);
+    // Listing reservation and sibling-cancellation only apply to
+    // listing-based orders — a request-based order has no listing, and
+    // no siblings to worry about (accept-offer already guarantees at
+    // most one order per request).
+    if (order.listing_id) {
+      await client.query("update listings set status = 'reserved', reserved_order_id = $1 where id = $2", [req.params.id, order.listing_id]);
 
-    const siblings = await client.query(
-      "select id from orders where listing_id = $1 and status = 'pending' and id <> $2",
-      [order.listing_id, req.params.id]
-    );
-    for (const s of siblings.rows) {
-      await client.query(
-        "update orders set status = 'cancelled', cancelled_at = now(), cancelled_by = 'seller', cancel_reason = 'listing_reserved_elsewhere' where id = $1",
-        [s.id]
+      const siblings = await client.query(
+        "select id from orders where listing_id = $1 and status = 'pending' and id <> $2",
+        [order.listing_id, req.params.id]
       );
-      await logStatus(client, s.id, "pending", "cancelled", req.user.id, "Listing reserved for a different buyer");
+      for (const s of siblings.rows) {
+        await client.query(
+          "update orders set status = 'cancelled', cancelled_at = now(), cancelled_by = 'seller', cancel_reason = 'listing_reserved_elsewhere' where id = $1",
+          [s.id]
+        );
+        await logStatus(client, s.id, "pending", "cancelled", req.user.id, "Listing reserved for a different buyer");
+      }
     }
 
     await client.query("COMMIT");
@@ -327,8 +395,8 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
   const isBuyer = order.buyer_id === req.user.id;
   const isSeller = order.seller_id === req.user.id;
   if (!isBuyer && !isSeller) return res.status(403).json({ error: "Not your order." });
-  if (isBuyer && order.status !== "pending") return res.status(400).json({ error: "Buyers can only cancel a pending order." });
-  if (isSeller && !["pending", "accepted", "preparing"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}', can't cancel.` });
+  if (isBuyer && !["pending", "sourcing"].includes(order.status)) return res.status(400).json({ error: "Buyers can only cancel a pending or sourcing order." });
+  if (isSeller && !["pending", "sourcing", "accepted", "preparing"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}', can't cancel.` });
 
   const actor = isSeller ? "seller" : "buyer";
   const client = await pool.connect();
@@ -342,9 +410,11 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
     const notifyTarget = actor === "seller" ? order.buyer_id : order.seller_id;
     await notify(client, notifyTarget, "order_cancelled", "Order cancelled", order.id, order.id);
 
-    const listing = await client.query("select * from listings where id = $1", [order.listing_id]);
-    if (listing.rows.length && listing.rows[0].reserved_order_id === req.params.id) {
-      await client.query("update listings set status = 'active', reserved_order_id = null where id = $1", [order.listing_id]);
+    if (order.listing_id) {
+      const listing = await client.query("select * from listings where id = $1", [order.listing_id]);
+      if (listing.rows.length && listing.rows[0].reserved_order_id === req.params.id) {
+        await client.query("update listings set status = 'active', reserved_order_id = null where id = $1", [order.listing_id]);
+      }
     }
 
     await client.query("COMMIT");
@@ -360,6 +430,33 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
 // --- Fulfilment sequence -------------------------------------------------
 // pickup:   accepted -> preparing -> ready_for_pickup -> collected -> completed
 // delivery: accepted -> preparing -> out_for_delivery -> delivered -> completed
+
+// The seller has actually obtained a sourced part — moves straight to
+// 'accepted' rather than back through 'pending', since sourcing it in
+// the first place already is the seller's commitment (equivalent to
+// accepting a normal order). From here it joins the same fulfilment
+// lifecycle as any other order.
+router.post("/:id/confirm-sourced", requireAuth, async (req, res) => {
+  const order = await getOrderOr404(req, res);
+  if (!order) return;
+  if (order.seller_id !== req.user.id) return res.status(403).json({ error: "Only the seller can confirm sourcing." });
+  if (order.status !== "sourcing") return res.status(400).json({ error: `Order is '${order.status}', not awaiting sourcing.` });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updated = await client.query("update orders set status = 'accepted', accepted_at = now() where id = $1 returning *", [req.params.id]);
+    await logStatus(client, req.params.id, "sourcing", "accepted", req.user.id, "Seller confirmed the part has been sourced");
+    await notify(client, order.buyer_id, "order_accepted", "Part sourced", `Order ${order.id} — the seller found your part.`, order.id);
+    await client.query("COMMIT");
+    res.json({ order: updated.rows[0] });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+});
 
 router.post("/:id/prepare", requireAuth, async (req, res) => {
   const order = await getOrderOr404(req, res);
@@ -447,7 +544,7 @@ router.post("/:id/redeem-code", requireAuth, async (req, res) => {
 });
 
 router.post("/:id/dispute", requireAuth, async (req, res) => {
-  const { reason, description } = req.body;
+  const { reason, description, images } = req.body;
   const order = await getOrderOr404(req, res);
   if (!order) return;
   if (order.buyer_id !== req.user.id) return res.status(403).json({ error: "Only the buyer can report a problem." });
@@ -459,8 +556,8 @@ router.post("/:id/dispute", requireAuth, async (req, res) => {
     await logStatus(client, req.params.id, order.status, "disputed", req.user.id, reason);
 
     const dispute = await client.query(
-      "insert into disputes (order_id, reporter_id, reason, description) values ($1,$2,$3,$4) returning *",
-      [req.params.id, req.user.id, reason, description]
+      "insert into disputes (order_id, reporter_id, reason, description, images) values ($1,$2,$3,$4,$5) returning *",
+      [req.params.id, req.user.id, reason, description, JSON.stringify(images || [])]
     );
     await client.query(
       "insert into dispute_events (dispute_id, actor_id, event_type, detail) values ($1,$2,'opened',$3)",
