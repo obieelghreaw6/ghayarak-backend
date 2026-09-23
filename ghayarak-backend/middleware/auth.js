@@ -20,27 +20,36 @@ async function requireAuth(req, res, next) {
   // what the user did in the meantime.
   //
   // This also re-checks the user's live status on every request, not just
-  // at login — banning or suspending someone doesn't revoke their existing
-  // sessions, so without this a banned user with a still-valid token could
-  // keep acting on the platform until their token happened to expire.
+  // at login. A banned user is locked out entirely — banning doesn't
+  // revoke existing sessions on its own, so without this a banned user
+  // with a still-valid token could keep acting on the platform until
+  // their token happened to expire. A suspended user is deliberately
+  // treated differently: they can still sign in and handle whatever
+  // they're already committed to (existing orders, conversations) —
+  // suspension blocks new listings, new offers, and receiving new
+  // orders (enforced where those actually happen), not access itself.
+  // req.user.status is attached below specifically so those checks have
+  // something to check.
   try {
     const { rows } = await query(
-      `select s.id from sessions s
+      `select s.id,
+              case when u.status = 'suspended' and u.suspended_until is not null and u.suspended_until <= now()
+                   then 'approved' else u.status end as status
+       from sessions s
        join users u on u.id = s.user_id
        where s.token_jti = $1 and s.revoked_at is null and s.expires_at > now()
-         and u.status = 'approved' and u.deleted_at is null`,
+         and u.status <> 'banned' and u.deleted_at is null`,
       [payload.jti]
     );
     if (!rows.length) return res.status(401).json({ error: "Session expired, please sign in again." });
 
     query("update sessions set last_active_at = now() where token_jti = $1", [payload.jti]).catch(() => {});
+    req.user = { ...payload, status: rows[0].status };
+    return next();
   } catch (e) {
     console.error("Session check failed", e);
     return res.status(401).json({ error: "Session expired, please sign in again." });
   }
-
-  req.user = payload;
-  next();
 }
 
 function requireRole(...roles) {
