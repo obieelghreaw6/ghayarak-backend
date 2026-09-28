@@ -171,6 +171,47 @@ router.get("/lookup-by-code/:code", requireAuth, async (req, res) => {
   res.json({ order });
 });
 
+// What Ghayarak actually did for this seller this calendar month — the
+// funnel from enquiry to money, from real rows, so a seller can see the
+// case for paying commission instead of taking the customer offline.
+// Must sit before GET /:id or "my-impact" would be read as an order id.
+router.get("/my-impact", requireAuth, async (req, res) => {
+  const me = req.user.id;
+  const [enquiries, offers, received, sales] = await Promise.all([
+    query(
+      `select count(*) as total from (
+         select distinct m.listing_id, m.sender_id
+         from messages m join listings l on l.id = m.listing_id
+         where l.seller_id = $1 and m.sender_id <> $1 and m.created_at >= date_trunc('month', now())
+       ) x`,
+      [me]
+    ),
+    query("select count(*) as total from part_offers where seller_id = $1 and created_at >= date_trunc('month', now())", [me]),
+    query(
+      `select count(*) as received,
+              count(*) filter (where payment_method = 'reserve_at_shop') as reservations
+       from orders where seller_id = $1 and created_at >= date_trunc('month', now())`,
+      [me]
+    ),
+    query(
+      `select count(*) as completed,
+              coalesce(sum(part_price), 0) as sales_value,
+              coalesce(sum(commission_amount), 0) as commission
+       from orders where seller_id = $1 and status = 'completed' and completed_at >= date_trunc('month', now())`,
+      [me]
+    ),
+  ]);
+  res.json({
+    enquiries: Number(enquiries.rows[0].total),
+    offersSubmitted: Number(offers.rows[0].total),
+    ordersReceived: Number(received.rows[0].received),
+    reservations: Number(received.rows[0].reservations),
+    completedSales: Number(sales.rows[0].completed),
+    salesValue: Number(sales.rows[0].sales_value),
+    commission: Number(sales.rows[0].commission),
+  });
+});
+
 // Public trust data — a real completion rate and response time, not a
 // single star rating with nothing behind it. No auth needed: this is
 // exactly the kind of thing a buyer should be able to check before
@@ -186,12 +227,25 @@ router.get("/seller-stats/:sellerId", async (req, res) => {
   );
   const r = rows[0];
   const terminal = Number(r.terminal);
+  const completed = Number(r.completed);
+  const completionRate = terminal > 0 ? Math.round((completed / terminal) * 100) : null;
+  const averageResponseHours = r.avg_response_seconds !== null ? Math.round((Number(r.avg_response_seconds) / 3600) * 10) / 10 : null;
+
+  // Earned from real history only — never assigned by hand, and never
+  // shown for a seller with too little history to mean anything. These
+  // thresholds are starting points to tune once real pilot data exists,
+  // not established standards.
+  let tier = null;
+  if (completed >= 25 && completionRate >= 90 && averageResponseHours !== null && averageResponseHours <= 4) tier = "high_performing";
+  else if (completed >= 5 && completionRate >= 80) tier = "trusted";
+
   res.json({
-    completedTransactions: Number(r.completed),
+    completedTransactions: completed,
     // null (not 0%) when there's not enough history to mean anything —
     // a brand-new seller's first order shouldn't show as "0% completion."
-    completionRate: terminal > 0 ? Math.round((Number(r.completed) / terminal) * 100) : null,
-    averageResponseHours: r.avg_response_seconds !== null ? Math.round((Number(r.avg_response_seconds) / 3600) * 10) / 10 : null,
+    completionRate,
+    averageResponseHours,
+    tier,
   });
 });
 
