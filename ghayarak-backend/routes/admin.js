@@ -238,6 +238,60 @@ router.get("/revenue-chart", async (req, res) => {
 // (that's real infrastructure work, not a database query), but genuine
 // signal from what the database actually shows, with a status color
 // derived from real thresholds rather than invented for show.
+// Where the marketplace is and isn't finding people their parts — the
+// match rate is the number that says whether Ghayarak is getting
+// stronger, and unmatched demand by make/city is where to recruit next.
+// A request the requester cancelled isn't unmet demand, so it's left out
+// of both the denominator and the unmatched lists.
+router.get("/demand-intel", async (req, res) => {
+  const [requestCounts, orderCounts, timing, unmatchedMakes, unmatchedCities] = await Promise.all([
+    query(
+      `select count(*) filter (where status <> 'cancelled') as total,
+              count(*) filter (where status = 'matched') as matched,
+              count(*) filter (where status in ('open', 'expired')) as unmatched
+       from part_requests`
+    ),
+    query(
+      `select count(*) as from_requests,
+              count(*) filter (where status = 'completed') as completed,
+              coalesce(avg(part_price) filter (where status = 'completed'), 0) as avg_price
+       from orders where request_id is not null`
+    ),
+    query(
+      `select extract(epoch from avg(o.created_at - pr.created_at)) as avg_seconds
+       from orders o join part_requests pr on pr.id = o.request_id`
+    ),
+    query(
+      `select make as label, count(*) as n from part_requests
+       where status in ('open', 'expired') group by make order by n desc limit 5`
+    ),
+    query(
+      `select city as label, count(*) as n from part_requests
+       where status in ('open', 'expired') group by city order by n desc limit 5`
+    ),
+  ]);
+
+  const rc = requestCounts.rows[0];
+  const oc = orderCounts.rows[0];
+  const total = Number(rc.total);
+  const matched = Number(rc.matched);
+  const fromRequests = Number(oc.from_requests);
+  res.json({
+    totalRequests: total,
+    matchedRequests: matched,
+    unmatchedRequests: Number(rc.unmatched),
+    // null, not 0%, until there is something to measure.
+    matchRate: total > 0 ? Math.round((matched / total) * 100) : null,
+    ordersFromRequests: fromRequests,
+    completedFromRequests: Number(oc.completed),
+    matchToCompletedRate: fromRequests > 0 ? Math.round((Number(oc.completed) / fromRequests) * 100) : null,
+    averageAcceptedPrice: Math.round(Number(oc.avg_price) * 100) / 100,
+    averageHoursToMatch: timing.rows[0].avg_seconds !== null ? Math.round((Number(timing.rows[0].avg_seconds) / 3600) * 10) / 10 : null,
+    topUnmatchedMakes: unmatchedMakes.rows.map((r) => ({ label: r.label, count: Number(r.n) })),
+    topUnmatchedCities: unmatchedCities.rows.map((r) => ({ label: r.label, count: Number(r.n) })),
+  });
+});
+
 router.get("/health", async (req, res) => {
   const [orderHealth, requestHealth, paymentHealth, sellerHealth] = await Promise.all([
     query(`select
