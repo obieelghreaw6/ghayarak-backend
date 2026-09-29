@@ -249,6 +249,29 @@ router.get("/seller-stats/:sellerId", async (req, res) => {
   });
 });
 
+// Public — reviews left ABOUT this user (as a seller, i.e. buyer_on_seller
+// only; a seller's private notes on past buyers aren't shown to shoppers).
+// Must sit before GET /:id or "reviews" would be read as an order id.
+router.get("/reviews/:userId", async (req, res) => {
+  const { rows } = await query(
+    `select r.*, u.name as reviewer_name
+     from reviews r join users u on u.id = r.reviewer_id
+     where r.reviewee_id = $1 and r.direction = 'buyer_on_seller'
+     order by r.created_at desc limit 50`,
+    [req.params.userId]
+  );
+  const avg = await query(
+    `select coalesce(avg(overall_rating), 0) as avg_rating, count(*) as total
+     from reviews where reviewee_id = $1 and direction = 'buyer_on_seller'`,
+    [req.params.userId]
+  );
+  res.json({
+    reviews: rows,
+    averageRating: Math.round(Number(avg.rows[0].avg_rating) * 10) / 10,
+    totalReviews: Number(avg.rows[0].total),
+  });
+});
+
 router.get("/:id", requireAuth, async (req, res) => {
   const { rows } = await query(
     `select o.*,
@@ -270,16 +293,17 @@ router.get("/:id", requireAuth, async (req, res) => {
   if (![order.buyer_id, order.seller_id].includes(req.user.id) && !STAFF_ROLES.includes(req.user.role)) {
     return res.status(403).json({ error: "Not your order." });
   }
-  const [history, disputes, protection, refunds, bankConfirmations] = await Promise.all([
+  const [history, disputes, protection, refunds, bankConfirmations, reviews] = await Promise.all([
     query("select * from order_status_history where order_id = $1 order by created_at asc", [req.params.id]),
     query("select * from disputes where order_id = $1 order by created_at desc", [req.params.id]),
     query("select * from buyer_protection where order_id = $1", [req.params.id]),
     query("select * from refunds where order_id = $1 order by created_at desc", [req.params.id]),
     query("select * from bank_transfer_confirmations where order_id = $1 order by created_at desc", [req.params.id]),
+    query("select * from reviews where order_id = $1", [req.params.id]),
   ]);
   res.json({
     order, history: history.rows, disputes: disputes.rows, protection: protection.rows[0] || null,
-    refunds: refunds.rows, bankTransferConfirmations: bankConfirmations.rows,
+    refunds: refunds.rows, bankTransferConfirmations: bankConfirmations.rows, reviews: reviews.rows,
   });
 });
 
@@ -574,6 +598,41 @@ router.post("/:id/confirm", requireAuth, async (req, res) => {
 
   const result = await completeOrder(order, req.user.id);
   res.json(result);
+});
+
+// No completed transaction, no review — the whole point is that this
+// can't become a fake-rating system. Direction is derived from who's
+// actually asking, not trusted from the request body, so a buyer can
+// never submit a seller_on_buyer review by passing the wrong string.
+router.post("/:id/review", requireAuth, async (req, res) => {
+  const order = await getOrderOr404(req, res);
+  if (!order) return;
+  if (order.status !== "completed") return res.status(400).json({ error: "Only a completed order can be reviewed." });
+
+  let direction, revieweeId;
+  if (order.buyer_id === req.user.id) { direction = "buyer_on_seller"; revieweeId = order.seller_id; }
+  else if (order.seller_id === req.user.id) { direction = "seller_on_buyer"; revieweeId = order.buyer_id; }
+  else return res.status(403).json({ error: "Only the buyer or seller on this order can review it." });
+
+  const { overallRating, accuracyRating, conditionRating, communicationRating, speedRating, paymentRating, pickupRating, comment } = req.body;
+  if (!overallRating || overallRating < 1 || overallRating > 5) {
+    return res.status(400).json({ error: "An overall rating from 1 to 5 is required." });
+  }
+
+  try {
+    const { rows } = await query(
+      `insert into reviews
+        (order_id, reviewer_id, reviewee_id, direction, overall_rating, accuracy_rating, condition_rating,
+         communication_rating, speed_rating, payment_rating, pickup_rating, comment)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning *`,
+      [req.params.id, req.user.id, revieweeId, direction, overallRating, accuracyRating || null, conditionRating || null,
+       communicationRating || null, speedRating || null, paymentRating || null, pickupRating || null, comment || null]
+    );
+    res.status(201).json({ review: rows[0] });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "You've already reviewed this order." });
+    throw e;
+  }
 });
 
 // Reserve & Pay at Shop: the seller redeems the buyer's code in person,
