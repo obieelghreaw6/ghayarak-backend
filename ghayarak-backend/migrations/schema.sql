@@ -117,6 +117,8 @@ create table if not exists shops (
 );
 create index if not exists idx_shops_owner on shops(owner_id);
 create index if not exists idx_shops_status on shops(status);
+alter table shops add column if not exists logo_url text;
+alter table shops add column if not exists cover_url text;
 
 -- Seller level for individuals (non-shop sellers). Shops have their own
 -- verified/tier system above; this is specifically for the "Individual"
