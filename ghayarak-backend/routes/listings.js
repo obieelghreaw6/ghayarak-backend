@@ -21,7 +21,7 @@ router.get("/mine", requireAuth, async (req, res) => {
 
 // GET /listings?category=&city=&q=&page=
 router.get("/", async (req, res) => {
-  const { category, city, q, page = 1, vehicleType } = req.query;
+  const { category, city, q, page = 1, vehicleType, sellerId } = req.query;
   const limit = 24;
   const offset = (Number(page) - 1) * limit;
 
@@ -45,6 +45,7 @@ router.get("/", async (req, res) => {
   if (vehicleType) { params.push(vehicleType); conditions.push(`l.vehicle_type = $${params.length}`); }
   if (city) { params.push(city); conditions.push(`l.city = $${params.length}`); }
   if (q) { params.push(`%${q.toLowerCase()}%`); conditions.push(`(lower(l.title) like $${params.length} or lower(l.make) like $${params.length} or lower(l.model) like $${params.length})`); }
+  if (sellerId) { params.push(sellerId); conditions.push(`l.seller_id = $${params.length}`); }
 
   params.push(limit, offset);
   const { rows } = await query(
