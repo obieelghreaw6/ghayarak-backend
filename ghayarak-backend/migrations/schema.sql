@@ -586,6 +586,33 @@ create table if not exists notifications (
 );
 create index if not exists idx_notifications_user on notifications(user_id, read_at);
 
+-- Counterfeit / incorrect / misleading listing reports. Deliberately its
+-- own lightweight table rather than folded into disputes: a report can
+-- come from anyone who spotted a problem browsing, not just someone with
+-- a completed order on it, so it can't be order-scoped the way disputes
+-- are. Admin actions on a report reuse the existing listing-remove and
+-- seller-suspend logic rather than duplicating it — this table just
+-- records what was reported and what the admin decided.
+create table if not exists listing_reports (
+  id uuid primary key default uuid_generate_v4(),
+  listing_id text not null references listings(id) on delete cascade,
+  reporter_id uuid not null references users(id) on delete cascade,
+  reason text not null check (reason in (
+    'counterfeit', 'mislabeled_original', 'wrong_part', 'misleading_description', 'stolen_illegal', 'other'
+  )),
+  description text,
+  images jsonb not null default '[]',
+  status text not null default 'open' check (status in (
+    'open', 'dismissed', 'info_requested', 'listing_hidden', 'seller_suspended', 'escalated'
+  )),
+  admin_note text,
+  resolved_by uuid references users(id),
+  resolved_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_listing_reports_listing on listing_reports(listing_id);
+create index if not exists idx_listing_reports_status on listing_reports(status);
+
 -- Part-request notification types added after the table was first
 -- created — the code was already using these, but the constraint never
 -- caught up, so every one of these inserts was silently failing.
