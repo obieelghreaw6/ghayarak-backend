@@ -20,7 +20,7 @@ const TIERS = {
 router.get("/", async (req, res) => {
   const { rows } = await query(
     `select id, name, city, description, business_type, tier, verified, whatsapp,
-            address, opening_hours, delivery_available, created_at
+            address, opening_hours, delivery_available, logo_url, cover_url, created_at
      from shops where status = 'approved' order by created_at desc`
   );
   res.json({ shops: rows });
@@ -37,7 +37,7 @@ router.get("/:id", async (req, res) => {
   // which belongs on a public storefront page.
   const { rows } = await query(
     `select id, name, city, description, business_type, tier, verified, whatsapp,
-            address, opening_hours, delivery_available, created_at
+            address, opening_hours, delivery_available, logo_url, cover_url, created_at
      from shops where id = $1 and status = 'approved'`,
     [req.params.id]
   );
@@ -83,6 +83,36 @@ router.post("/", requireAuth, rateLimit("shop_create", { max: 5, windowMinutes: 
   }
 
   res.status(201).json({ shop, paymentUrl });
+});
+
+// Owner editing their own shop — name, description, contact details,
+// delivery, and now logo/cover. No safe/sensitive-field split like
+// listings have: a shop's identity fields don't carry the same
+// mid-transaction bait-and-switch risk a listing's price or condition
+// would, so this doesn't reset approval status. Admin can still suspend
+// if something about an edit looks wrong.
+router.patch("/:id", requireAuth, async (req, res) => {
+  const before = await query("select * from shops where id = $1", [req.params.id]);
+  if (!before.rows.length) return res.status(404).json({ error: "Shop not found." });
+  if (before.rows[0].owner_id !== req.user.id) return res.status(403).json({ error: "Not your shop." });
+
+  const { name, city, description, whatsapp, address, openingHours, deliveryAvailable, logoUrl, coverUrl } = req.body;
+  const { rows } = await query(
+    `update shops set
+       name = coalesce($1, name),
+       city = coalesce($2, city),
+       description = coalesce($3, description),
+       whatsapp = coalesce($4, whatsapp),
+       address = coalesce($5, address),
+       opening_hours = coalesce($6, opening_hours),
+       delivery_available = coalesce($7, delivery_available),
+       logo_url = coalesce($8, logo_url),
+       cover_url = coalesce($9, cover_url)
+     where id = $10 returning *`,
+    [name || null, city || null, description || null, whatsapp || null, address || null, openingHours || null,
+     deliveryAvailable === undefined ? null : !!deliveryAvailable, logoUrl || null, coverUrl || null, req.params.id]
+  );
+  res.json({ shop: rows[0] });
 });
 
 // Renew or change tier for an existing shop.
