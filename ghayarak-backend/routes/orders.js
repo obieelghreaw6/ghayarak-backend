@@ -252,6 +252,56 @@ router.get("/seller-stats/:sellerId", async (req, res) => {
 // Public — reviews left ABOUT this user (as a seller, i.e. buyer_on_seller
 // only; a seller's private notes on past buyers aren't shown to shoppers).
 // Must sit before GET /:id or "reviews" would be read as an order id.
+// The individual (non-shop) seller equivalent of a shop's public page —
+// name and join date, real stats, and recent reviews in one call. No
+// "Verified" badge here: that's an admin-reviewed identity/business
+// check that shops go through and individuals currently don't, so
+// showing one would claim a verification that never happened.
+router.get("/seller-profile/:id", async (req, res) => {
+  const [user, orderStats, reviewStats, reviewRows] = await Promise.all([
+    query("select id, name, created_at from users where id = $1 and deleted_at is null", [req.params.id]),
+    query(
+      `select count(*) filter (where status = 'completed') as completed,
+              count(*) filter (where status in ('completed', 'cancelled', 'disputed')) as terminal,
+              extract(epoch from avg(accepted_at - created_at)) filter (where accepted_at is not null) as avg_response_seconds
+       from orders where seller_id = $1`,
+      [req.params.id]
+    ),
+    query(
+      `select coalesce(avg(overall_rating), 0) as avg_rating, count(*) as total
+       from reviews where reviewee_id = $1 and direction = 'buyer_on_seller'`,
+      [req.params.id]
+    ),
+    query(
+      `select r.*, u.name as reviewer_name from reviews r join users u on u.id = r.reviewer_id
+       where r.reviewee_id = $1 and r.direction = 'buyer_on_seller' order by r.created_at desc limit 10`,
+      [req.params.id]
+    ),
+  ]);
+  if (!user.rows.length) return res.status(404).json({ error: "Seller not found." });
+
+  const os = orderStats.rows[0];
+  const terminal = Number(os.terminal);
+  const completed = Number(os.completed);
+  const completionRate = terminal > 0 ? Math.round((completed / terminal) * 100) : null;
+  const averageResponseHours = os.avg_response_seconds !== null ? Math.round((Number(os.avg_response_seconds) / 3600) * 10) / 10 : null;
+  let tier = null;
+  if (completed >= 25 && completionRate >= 90 && averageResponseHours !== null && averageResponseHours <= 4) tier = "high_performing";
+  else if (completed >= 5 && completionRate >= 80) tier = "trusted";
+
+  res.json({
+    name: user.rows[0].name,
+    memberSince: user.rows[0].created_at,
+    completedTransactions: completed,
+    completionRate,
+    averageResponseHours,
+    tier,
+    averageRating: Math.round(Number(reviewStats.rows[0].avg_rating) * 10) / 10,
+    totalReviews: Number(reviewStats.rows[0].total),
+    reviews: reviewRows.rows,
+  });
+});
+
 router.get("/reviews/:userId", async (req, res) => {
   const { rows } = await query(
     `select r.*, u.name as reviewer_name
