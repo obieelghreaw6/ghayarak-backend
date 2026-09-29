@@ -509,6 +509,44 @@ router.post("/listings/:id/moderate", moderationOnly, async (req, res) => {
   res.json({ listing: rows[0] });
 });
 
+// Open reports, oldest first — a human needs to look at these.
+router.get("/listing-reports", moderationOnly, async (req, res) => {
+  const { status = "open" } = req.query;
+  const { rows } = await query(
+    `select lr.*, l.title as listing_title, l.status as listing_status,
+            reporter.name as reporter_name, seller.id as seller_id, seller.name as seller_name
+     from listing_reports lr
+     join listings l on l.id = lr.listing_id
+     join users reporter on reporter.id = lr.reporter_id
+     join users seller on seller.id = l.seller_id
+     where lr.status = $1
+     order by lr.created_at asc`,
+    [status]
+  );
+  res.json({ reports: rows });
+});
+
+// Records the resolution — the actual mutation (hiding the listing,
+// suspending the seller) happens through the existing dedicated
+// endpoints, called separately by whoever is resolving this, so there is
+// exactly one place each of those actions is implemented rather than two
+// slightly-different copies of the same logic.
+router.post("/listing-reports/:id/resolve", moderationOnly, async (req, res) => {
+  const { status, adminNote } = req.body;
+  const allowed = ["dismissed", "info_requested", "listing_hidden", "seller_suspended", "escalated"];
+  if (!allowed.includes(status)) return res.status(400).json({ error: "Invalid resolution status." });
+
+  const before = await query("select * from listing_reports where id = $1", [req.params.id]);
+  if (!before.rows.length) return res.status(404).json({ error: "Report not found." });
+
+  const { rows } = await query(
+    "update listing_reports set status = $1, admin_note = $2, resolved_by = $3, resolved_at = now() where id = $4 returning *",
+    [status, adminNote || null, req.user.id, req.params.id]
+  );
+  await writeAudit("listing_report", req.params.id, `resolved_${status}`, req.user.id, before.rows[0], rows[0]);
+  res.json({ report: rows[0] });
+});
+
 router.post("/listings/:id/remove", moderationOnly, async (req, res) => {
   const before = await query("select * from listings where id = $1", [req.params.id]);
   if (!before.rows.length) return res.status(404).json({ error: "Listing not found." });
