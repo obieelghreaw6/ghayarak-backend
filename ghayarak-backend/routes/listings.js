@@ -207,6 +207,25 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 // Start a boost payment — returns a DPAY hosted checkout URL.
+// Anyone can report a listing, not just someone who bought it — a
+// counterfeit or mislabeled part is a problem to catch by browsing, not
+// something that should have to wait for a transaction to surface.
+router.post("/:id/report", requireAuth, async (req, res) => {
+  const { reason, description, images } = req.body;
+  const allowedReasons = ["counterfeit", "mislabeled_original", "wrong_part", "misleading_description", "stolen_illegal", "other"];
+  if (!allowedReasons.includes(reason)) return res.status(400).json({ error: "Invalid report reason." });
+
+  const listing = await query("select id from listings where id = $1", [req.params.id]);
+  if (!listing.rows.length) return res.status(404).json({ error: "Listing not found." });
+
+  const { rows } = await query(
+    `insert into listing_reports (listing_id, reporter_id, reason, description, images)
+     values ($1,$2,$3,$4,$5) returning *`,
+    [req.params.id, req.user.id, reason, description || null, JSON.stringify(images || [])]
+  );
+  res.status(201).json({ report: rows[0] });
+});
+
 router.post("/:id/boost", requireAuth, async (req, res) => {
   const { rows } = await query("select * from listings where id = $1", [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: "Listing not found." });
