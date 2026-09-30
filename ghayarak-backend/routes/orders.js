@@ -222,7 +222,7 @@ router.get("/seller-stats/:sellerId", async (req, res) => {
     `select
        count(*) filter (where status = 'completed') as completed,
        count(*) filter (where status in ('completed', 'cancelled', 'disputed')) as terminal,
-       extract(epoch from avg(accepted_at - created_at)) filter (where accepted_at is not null) as avg_response_seconds
+       extract(epoch from avg(accepted_at - created_at) filter (where accepted_at is not null)) as avg_response_seconds
      from orders where seller_id = $1`,
     [req.params.sellerId]
   );
@@ -264,7 +264,7 @@ router.get("/seller-profile/:id", async (req, res) => {
     query(
       `select count(*) filter (where status = 'completed') as completed,
               count(*) filter (where status in ('completed', 'cancelled', 'disputed')) as terminal,
-              extract(epoch from avg(accepted_at - created_at)) filter (where accepted_at is not null) as avg_response_seconds
+              extract(epoch from avg(accepted_at - created_at) filter (where accepted_at is not null)) as avg_response_seconds
        from orders where seller_id = $1`,
       [req.params.id]
     ),
