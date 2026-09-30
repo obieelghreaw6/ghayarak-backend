@@ -1,5 +1,5 @@
 const express = require("express");
-const { query } = require("../db");
+const { pool, query } = require("../db");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const { createInvoice } = require("../payments/dpay");
@@ -7,6 +7,144 @@ const { createInvoice } = require("../payments/dpay");
 const router = express.Router();
 const BOOST_FEE = 15;
 const BOOST_DAYS = 7;
+const BULK_COLUMNS = ["title", "category", "make", "model", "yearFrom", "yearTo", "price", "condition", "city", "vehicleType", "description"];
+const BULK_MAX_ROWS = 2000;
+
+// A small dependency-free CSV parser rather than pulling in a library for
+// this one feature — handles quoted fields (so a description containing
+// a comma doesn't break column alignment) and doubled-quote escaping
+// ("" inside a quoted field means a literal "), which covers what a real
+// spreadsheet export actually produces.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  // Normalize line endings up front so \r\n and \r don't get treated as
+  // part of a field's content or as an extra blank row.
+  const s = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\n") {
+      row.push(field); field = "";
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((cell) => cell.trim() !== ""));
+}
+
+// Validates one parsed row against the same rules real listing creation
+// enforces — required fields present, price a real non-negative number,
+// vehicleType one of the three the database actually accepts (the only
+// field here with a real check constraint; everything else on a listing
+// is plain text with no fixed vocabulary in the database).
+function validateBulkRow(rowObj) {
+  const errors = [];
+  for (const f of ["title", "category", "make", "model", "condition", "city"]) {
+    if (!rowObj[f]?.trim()) errors.push(`Missing ${f}`);
+  }
+  const price = Number(rowObj.price);
+  if (!rowObj.price || Number.isNaN(price) || price < 0) errors.push("Price must be a non-negative number");
+  const vehicleType = rowObj.vehicleType?.trim() || "car";
+  if (!["car", "truck", "motorbike"].includes(vehicleType)) errors.push("vehicleType must be car, truck, or motorbike");
+  if (rowObj.yearFrom && Number.isNaN(Number(rowObj.yearFrom))) errors.push("yearFrom must be a number");
+  if (rowObj.yearTo && Number.isNaN(Number(rowObj.yearTo))) errors.push("yearTo must be a number");
+  return errors;
+}
+
+// Preview only — parses and validates, creates nothing. Lets the seller
+// see exactly what would happen (how many rows are fine, which ones need
+// fixing and why) before committing to anything, rather than importing
+// first and finding out about problems after the fact.
+router.post("/bulk/preview", requireAuth, async (req, res) => {
+  const { csv } = req.body;
+  if (!csv || typeof csv !== "string") return res.status(400).json({ error: "No CSV content received." });
+
+  const parsed = parseCsv(csv);
+  if (!parsed.length) return res.status(400).json({ error: "The file appears to be empty." });
+
+  const header = parsed[0].map((h) => h.trim());
+  const dataRows = parsed.slice(1);
+  if (dataRows.length > BULK_MAX_ROWS) {
+    return res.status(400).json({ error: `Too many rows (${dataRows.length}) — the limit per upload is ${BULK_MAX_ROWS}.` });
+  }
+
+  const valid = [];
+  const invalid = [];
+  dataRows.forEach((cells, i) => {
+    const rowObj = {};
+    header.forEach((col, j) => { rowObj[col] = cells[j] ?? ""; });
+    const errors = validateBulkRow(rowObj);
+    if (errors.length) invalid.push({ row: i + 2, data: rowObj, errors }); // +2: header is row 1, data is 1-indexed
+    else valid.push(rowObj);
+  });
+
+  res.json({ totalRows: dataRows.length, validCount: valid.length, invalidCount: invalid.length, validRows: valid, invalidRows: invalid });
+});
+
+// The actual import — takes the rows the seller confirmed after seeing
+// the preview (re-validated here too, never trusting that what comes
+// back from the client still matches what was actually checked), and
+// creates them as real listings, each going through moderation exactly
+// like one created by hand. All-or-nothing: if anything in the batch
+// fails partway, nothing is created, rather than leaving the seller with
+// a confusing partial import and no clear sense of what actually landed.
+router.post("/bulk/import", requireAuth, rateLimit("listing_bulk_import", { max: 5, windowMinutes: 60, keyFn: (req) => req.user.id }), async (req, res) => {
+  const { rows, shopId } = req.body;
+  if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: "No rows to import." });
+  if (rows.length > BULK_MAX_ROWS) return res.status(400).json({ error: `Too many rows — the limit per upload is ${BULK_MAX_ROWS}.` });
+
+  if (req.user.status !== "approved") {
+    return res.status(403).json({ error: "Your account is currently suspended and can't create new listings." });
+  }
+  if (shopId) {
+    const shop = await query("select status, suspended_until from shops where id = $1", [shopId]);
+    if (!shop.rows.length) return res.status(404).json({ error: "Shop not found." });
+    const s = shop.rows[0];
+    const shopSuspended = s.status === "suspended" && (!s.suspended_until || new Date(s.suspended_until) > new Date());
+    if (s.status === "banned" || shopSuspended) {
+      return res.status(403).json({ error: "This shop is currently suspended and can't create new listings." });
+    }
+  }
+
+  const badRow = rows.map((r, i) => ({ i, errors: validateBulkRow(r) })).find((r) => r.errors.length);
+  if (badRow) return res.status(400).json({ error: `Row ${badRow.i + 1} is no longer valid: ${badRow.errors.join(", ")}` });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    let created = 0;
+    for (const r of rows) {
+      await client.query(
+        `insert into listings (seller_id, shop_id, title, category, make, model, year_from, year_to, price, condition, city, description, vehicle_type)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [req.user.id, shopId || null, r.title.trim(), r.category.trim(), r.make.trim(), r.model.trim(),
+         r.yearFrom ? Number(r.yearFrom) : null, r.yearTo ? Number(r.yearTo) : null, Number(r.price),
+         r.condition.trim(), r.city.trim(), r.description?.trim() || null, (r.vehicleType?.trim() || "car")]
+      );
+      created++;
+    }
+    await client.query("COMMIT");
+    res.status(201).json({ created });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+});
 
 // GET /listings/mine — every listing the current user owns, regardless
 // of moderation status. Must come before the /:id route below (Express
