@@ -87,14 +87,14 @@ router.post(
   requireAuth,
   rateLimit("request_create", { max: 10, windowMinutes: 60, keyFn: (req) => req.user.id }),
   async (req, res) => {
-    const { make, model, year, partDescription, conditionPreference, city, urgency } = req.body;
+    const { make, model, year, partDescription, conditionPreference, city, urgency, images } = req.body;
     if (!make || !model || !partDescription || !city) {
       return res.status(400).json({ error: "Make, model, part description, and city are required." });
     }
     const { rows } = await query(
-      `insert into part_requests (requester_id, make, model, year, part_description, condition_preference, city, urgency)
-       values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
-      [req.user.id, make, model, year || null, partDescription, conditionPreference || null, city, urgency || "flexible"]
+      `insert into part_requests (requester_id, make, model, year, part_description, condition_preference, city, urgency, images)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
+      [req.user.id, make, model, year || null, partDescription, conditionPreference || null, city, urgency || "flexible", JSON.stringify(images || [])]
     );
     const request = rows[0];
 
@@ -134,7 +134,7 @@ router.post(
   requireAuth,
   rateLimit("offer_create", { max: 30, windowMinutes: 60, keyFn: (req) => req.user.id }),
   async (req, res) => {
-    const { price, condition, notes, deliveryAvailable, shopId, clientKey, canSource, sourcingDays } = req.body;
+    const { price, condition, notes, deliveryAvailable, shopId, clientKey, canSource, sourcingDays, images } = req.body;
     if (!price || price <= 0 || !condition) {
       return res.status(400).json({ error: "A positive price and condition are required." });
     }
@@ -163,9 +163,9 @@ router.post(
     let rows, isReplay = false;
     try {
       ({ rows } = await query(
-        `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available, client_key, can_source, sourcing_days)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
-        [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable, clientKey || null, !!canSource, canSource ? sourcingDays : null]
+        `insert into part_offers (request_id, seller_id, shop_id, price, condition, notes, delivery_available, client_key, can_source, sourcing_days, images)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,
+        [req.params.id, req.user.id, shopId || null, price, condition, notes || null, !!deliveryAvailable, clientKey || null, !!canSource, canSource ? sourcingDays : null, JSON.stringify(images || [])]
       ));
     } catch (e) {
       // A network-failure retry sends the same clientKey as the original
