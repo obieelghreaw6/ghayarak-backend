@@ -1,6 +1,7 @@
 const express = require("express");
 const { pool, query } = require("../db");
 const { requireAuth } = require("../middleware/auth");
+const { rateLimit } = require("../middleware/rateLimit");
 const { createInvoice } = require("../payments/dpay");
 
 const router = express.Router();
@@ -360,7 +361,7 @@ router.get("/:id", requireAuth, async (req, res) => {
 // Buyer places an order. This does not charge anyone — Ghayarak never
 // touches the payment. It records the order and snapshots pricing so
 // later listing-price changes can't retroactively alter what was agreed.
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", requireAuth, rateLimit("order_create", { max: 30, windowMinutes: 60, keyFn: (req) => req.user.id }), async (req, res) => {
   const { listingId, paymentMethod, paymentMethodDetail, deliveryMethod, includeProtection, deliveryAddress, deliveryNotes } = req.body;
 
   if (!["cash", "lypay", "card", "bank", "other", "reserve_at_shop"].includes(paymentMethod)) {
@@ -706,7 +707,7 @@ router.post("/:id/redeem-code", requireAuth, async (req, res) => {
   res.json(result);
 });
 
-router.post("/:id/dispute", requireAuth, async (req, res) => {
+router.post("/:id/dispute", requireAuth, rateLimit("dispute_create", { max: 10, windowMinutes: 60, keyFn: (req) => req.user.id }), async (req, res) => {
   const { reason, description, images } = req.body;
   const order = await getOrderOr404(req, res);
   if (!order) return;
@@ -771,7 +772,7 @@ router.post("/:id/bank-transfer-confirmation", requireAuth, async (req, res) => 
 // seller acknowledges they need to return it). This does not move money;
 // per Model A, Ghayarak never held it. It creates the record an admin
 // works through via /admin/refunds/:id/{approve,process,complete,reject}.
-router.post("/:id/refund-request", requireAuth, async (req, res) => {
+router.post("/:id/refund-request", requireAuth, rateLimit("refund_request", { max: 10, windowMinutes: 60, keyFn: (req) => req.user.id }), async (req, res) => {
   const { amount, reason } = req.body;
   const order = await getOrderOr404(req, res);
   if (!order) return;
