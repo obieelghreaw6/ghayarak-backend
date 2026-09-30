@@ -627,6 +627,25 @@ alter table notifications add constraint notifications_type_check check (type in
   'new_offer', 'request_cancelled', 'request_expired'
 ));
 
+-- Index audit — added now, as one deliberate pass, rather than only ever
+-- ad-hoc alongside whichever feature happened to need one at the time.
+-- users.status: checked on every single authenticated request (see
+-- requireAuth) — the hottest possible path for this column to be missing
+-- an index on.
+create index if not exists idx_users_status on users(status);
+-- part_requests had zero indexes beyond its primary key despite being
+-- central to demand alerts, matching, and expiry — status and
+-- requester_id are both filtered on constantly.
+create index if not exists idx_part_requests_status on part_requests(status);
+create index if not exists idx_part_requests_requester on part_requests(requester_id);
+-- A functional index matching the exact lower(make) comparison the
+-- demand-alert query actually runs — a plain index on make wouldn't be
+-- usable by that specific comparison.
+create index if not exists idx_listings_make_lower on listings(lower(make));
+create index if not exists idx_listings_shop on listings(shop_id);
+create index if not exists idx_orders_shop on orders(shop_id);
+create index if not exists idx_part_offers_seller on part_offers(seller_id);
+
 create table if not exists payments (
   id uuid primary key default uuid_generate_v4(),
   dpay_invoice_id text unique not null,
@@ -721,20 +740,11 @@ create index if not exists idx_rate_limit_lookup on rate_limit_events(identifier
 -- Counterfeit / stolen / misrepresented / unsafe reports on a LISTING —
 -- distinct from `disputes`, which are order-scoped. A listing can be
 -- reported before anyone has ever ordered it.
-create table if not exists listing_reports (
-  id uuid primary key default uuid_generate_v4(),
-  listing_id text not null references listings(id) on delete cascade,
-  reporter_id uuid references users(id),
-  reason text not null check (reason in ('counterfeit', 'stolen', 'misrepresented', 'unsafe', 'other')),
-  description text,
-  status text not null default 'open' check (status in ('open', 'investigating', 'resolved', 'dismissed')),
-  resolution_action text check (resolution_action in ('none', 'listing_hidden', 'seller_contacted', 'seller_suspended')),
-  resolved_by uuid references users(id),
-  created_at timestamptz not null default now(),
-  resolved_at timestamptz
-);
-create index if not exists idx_listing_reports_listing on listing_reports(listing_id);
-create index if not exists idx_listing_reports_status on listing_reports(status);
+-- (A stale, incompatible early draft of listing_reports used to be
+-- defined here — superseded by the real one earlier in this file, which
+-- is what actually created the live table since CREATE TABLE IF NOT
+-- EXISTS runs top-to-bottom. Removed rather than left as dead, misleading
+-- code with a different reason list and no images column.)
 
 -- Every committed search, with how many results it returned. This is the
 -- source for "unfulfilled demand" reporting — queries that return zero or
