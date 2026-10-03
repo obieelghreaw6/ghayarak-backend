@@ -6,6 +6,7 @@ const { requireAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const { hashPassword, verifyPassword, generateToken, hashToken } = require("../lib/password");
 const { generateSecret, verifyTotp, otpAuthUrl } = require("../lib/totp");
+const { sendEmail } = require("../lib/email");
 
 const router = express.Router();
 
@@ -60,8 +61,20 @@ router.post(
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
     await query("insert into otp_codes (contact, code, expires_at) values ($1, $2, $3)", [contact, code, expiresAt]);
 
-    // TODO: replace with a real SMS/email send.
-    console.log(`[OTP] ${contact} -> ${code} (expires in 5 min)`);
+    // Real delivery for email contacts now. Phone numbers still only log
+    // to the console — that's a genuinely separate piece of work (a
+    // Libya-capable SMS gateway, likely a paid contract), deliberately
+    // left as a visible, logged gap rather than silently pretending it's
+    // solved too.
+    if (isEmail(contact)) {
+      await sendEmail({
+        to: contact,
+        subject: `Your Ghayarak code: ${code}`,
+        text: `Your Ghayarak login code is ${code}. It expires in 5 minutes. If you didn't request this, you can ignore this email.`,
+      });
+    } else {
+      console.log(`[OTP — phone, SMS not yet wired up] ${contact} -> ${code} (expires in 5 min)`);
+    }
     res.json({ ok: true, message: "Code sent." });
   }
 );
@@ -144,8 +157,12 @@ router.post(
       "insert into email_verification_tokens (user_id, token_hash, expires_at) values ($1,$2, now() + interval '24 hours')",
       [user.id, tokenHash]
     );
-    // TODO: email verifyToken to the user instead of logging it.
-    console.log(`[EMAIL VERIFY] ${email} -> token: ${verifyToken}`);
+    const verifyUrl = `${process.env.FRONTEND_URL || "https://ghayarak-frontend.vercel.app"}/verify-email?token=${verifyToken}`;
+    await sendEmail({
+      to: email,
+      subject: "Confirm your Ghayarak email",
+      text: `Welcome to Ghayarak. Confirm your email: ${verifyUrl}\n\nThis link expires in 24 hours.`,
+    });
 
     const client = await pool.connect();
     try {
