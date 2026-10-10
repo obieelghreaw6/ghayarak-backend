@@ -196,8 +196,6 @@ create index if not exists idx_uploads_uploader on uploads(uploader_id);
 create index if not exists idx_uploads_attached on uploads(attached_to);
 
 alter table listings add column if not exists images jsonb not null default '[]';
-alter table part_requests add column if not exists images jsonb not null default '[]';
-alter table part_offers add column if not exists images jsonb not null default '[]';
 alter table shops add column if not exists logo_url text;
 alter table shops add column if not exists cover_url text;
 create index if not exists idx_listings_moderation on listings(moderation_status);
@@ -827,3 +825,45 @@ begin
     );
   end loop;
 end $$;
+
+-- ---------------------------------------------------------------------
+-- Buyer-paid protection fee (Ghayarak's revenue is charged to the buyer on
+-- top of the listed price; the seller keeps the full price).
+-- Every statement below is idempotent and safe to re-run on every boot.
+-- ---------------------------------------------------------------------
+
+-- Who pays Ghayarak's fee on an order. Existing orders stay 'seller'
+-- (old behaviour); new orders are 'buyer'.
+alter table orders add column if not exists fee_payer text not null default 'seller' check (fee_payer in ('seller', 'buyer'));
+
+-- Allow payments.kind = 'protection'. Only touches the constraint if it
+-- doesn't already allow it, so it does not rewrite anything on later boots.
+do $$
+declare c record;
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'payments'::regclass and contype = 'c'
+      and pg_get_constraintdef(oid) like '%''protection''%'
+  ) then
+    for c in
+      select conname from pg_constraint
+      where conrelid = 'payments'::regclass and contype = 'c'
+        and pg_get_constraintdef(oid) like '%subscription%'
+    loop
+      execute format('alter table payments drop constraint %I', c.conname);
+    end loop;
+    alter table payments add constraint payments_kind_check
+      check (kind in ('boost', 'subscription', 'protected_deal', 'commission', 'protection'));
+  end if;
+end $$;
+
+-- At most one open-or-paid protection payment per order, so a double tap
+-- or retry can never bill the buyer twice.
+create unique index if not exists idx_payments_one_open_protection
+  on payments(ref_id) where kind = 'protection' and status in ('pending', 'paid');
+
+-- Moved here from above: these tables are created further down the file, so
+-- altering them earlier made the schema fail on a brand-new empty database.
+alter table part_requests add column if not exists images jsonb not null default '[]';
+alter table part_offers add column if not exists images jsonb not null default '[]';
