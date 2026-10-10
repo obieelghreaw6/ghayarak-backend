@@ -50,6 +50,26 @@ router.post("/dpay", async (req, res) => {
       }
     }
 
+    // Buyer-paid protection fee — p.ref_id is an orders.id. The fee is
+    // Ghayarak's revenue: record it once (this branch only runs on the
+    // pending -> paid transition), mark the order's settlement paid if one
+    // exists already, and if the order was cancelled in the meantime queue
+    // a refund request so the fee goes back to the buyer.
+    if (p.kind === "protection") {
+      await query("insert into revenue_events (source, amount, ref_id) values ('protection', $1, $2)", [p.amount, p.ref_id]);
+      await query("update settlements set status = 'paid', paid_at = now() where order_id = $1 and status <> 'paid'", [p.ref_id]);
+      const ord = await query("select id, status, buyer_id from orders where id = $1", [p.ref_id]);
+      if (ord.rows.length && ["cancelled", "refunded"].includes(ord.rows[0].status)) {
+        const dup = await query("select id from refunds where order_id = $1 and reason like 'Protection fee refund%' and status <> 'rejected' limit 1", [p.ref_id]);
+        if (!dup.rows.length) {
+          await query(
+            "insert into refunds (order_id, amount, reason, requested_by) values ($1,$2,$3,$4)",
+            [p.ref_id, p.amount, "Protection fee refund — fee paid after the order was cancelled", ord.rows[0].buyer_id]
+          );
+        }
+      }
+    }
+
     // Commission invoices are billed to the SELLER (they owe Ghayarak, not
     // the other way around) — p.ref_id here is a settlements.id.
     // Guard against double-counting: this webhook can retry/redeliver, and
