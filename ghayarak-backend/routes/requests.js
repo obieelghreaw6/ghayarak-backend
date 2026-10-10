@@ -3,11 +3,11 @@ const { pool, query } = require("../db");
 const { requireAuth, optionalAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 
+const { FEE_PCT, computeFee, ensureProtectionInvoice } = require("../lib/protectionFee");
+
 const router = express.Router();
-// Matches the same constant in orders.js — a genuine sale happening
-// through the request/offer path earns Ghayarak the same commission as
-// any other order.
-const COMMISSION_PCT = 5.0;
+// A sale through the request/offer path carries the same buyer-paid
+// protection fee as any other order (see lib/protectionFee.js).
 
 // There's no background job running on a schedule, so expiry is checked
 // lazily — whenever requests actually get read — rather than via real
@@ -229,7 +229,7 @@ router.post("/:id/accept-offer", requireAuth, async (req, res) => {
   if (!offer.rows.length) return res.status(404).json({ error: "Offer not found." });
   const o = offer.rows[0];
 
-  const commissionAmount = Math.round(Number(o.price) * (COMMISSION_PCT / 100) * 100) / 100;
+  const feeAmount = computeFee(o.price);
   // Never silently treated as in-stock: a sourcing offer starts its own
   // distinct status, well before the normal fulfilment lifecycle begins.
   const startStatus = o.can_source ? "sourcing" : "pending";
@@ -241,10 +241,10 @@ router.post("/:id/accept-offer", requireAuth, async (req, res) => {
     try {
       const inserted = await client.query(
         `insert into orders
-          (request_id, offer_id, buyer_id, seller_id, shop_id, part_price, commission_pct, commission_amount,
-           payment_method, payment_category, delivery_method, status)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,'cash','cash','pickup',$9) returning *`,
-        [req.params.id, offerId, req.user.id, o.seller_id, o.shop_id, o.price, COMMISSION_PCT, commissionAmount, startStatus]
+          (request_id, offer_id, buyer_id, seller_id, shop_id, part_price, protection_fee, commission_pct, commission_amount,
+           fee_payer, payment_method, payment_category, delivery_method, status)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'buyer','cash','cash','pickup',$10) returning *`,
+        [req.params.id, offerId, req.user.id, o.seller_id, o.shop_id, o.price, feeAmount, FEE_PCT, feeAmount, startStatus]
       );
       orderRow = inserted.rows[0];
     } catch (e) {
@@ -254,6 +254,10 @@ router.post("/:id/accept-offer", requireAuth, async (req, res) => {
         return res.json({ request: request.rows[0], order: existing.rows[0] });
       }
       throw e;
+    }
+
+    if (feeAmount > 0) {
+      await client.query("insert into buyer_protection (order_id, fee_amount) values ($1,$2)", [orderRow.id, feeAmount]);
     }
 
     await client.query(
@@ -278,7 +282,9 @@ router.post("/:id/accept-offer", requireAuth, async (req, res) => {
     );
 
     await client.query("COMMIT");
-    res.json({ request: updatedRequest.rows[0], order: orderRow });
+    // After COMMIT, never throws (see lib/protectionFee.js).
+    const protectionInvoice = await ensureProtectionInvoice(orderRow);
+    res.json({ request: updatedRequest.rows[0], order: orderRow, protectionInvoice });
   } catch (e) {
     await client.query("ROLLBACK");
     throw e;
