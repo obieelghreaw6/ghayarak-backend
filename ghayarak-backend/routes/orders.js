@@ -3,12 +3,15 @@ const { pool, query } = require("../db");
 const { requireAuth } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const { createInvoice } = require("../payments/dpay");
+const { FEE_PCT, computeFee, feeGateEnabled, feeIsBuyerPaid, isFeePaid, ensureProtectionInvoice, queueFeeRefundIfPaid } = require("../lib/protectionFee");
 
 const router = express.Router();
 
-const COMMISSION_PCT = 5.0;
+// Ghayarak's revenue is a protection fee charged to the BUYER on top of the
+// listed price (see lib/protectionFee.js). The seller keeps the full listed
+// price. Orders created before this change have fee_payer = 'seller' and
+// keep the old behaviour (seller invoiced the commission after completion).
 const DELIVERY_FLAT = 50;
-const PROTECTION_PCT = 0.05;
 const OPEN_STATUSES = ["pending", "accepted", "preparing", "ready_for_pickup", "out_for_delivery", "collected", "delivered"];
 
 async function logStatus(client, orderId, fromStatus, toStatus, changedBy, note) {
@@ -77,6 +80,7 @@ async function completeOrder(order, actorId) {
           [s.id]
         );
         await logStatus(client, s.id, s.status, "cancelled", actorId, "Listing already sold through a different order");
+        await queueFeeRefundIfPaid(client, s.id, actorId, "listing sold through a different order");
         const sibling = await client.query("select buyer_id from orders where id = $1", [s.id]);
         await notify(client, sibling.rows[0].buyer_id, "order_cancelled", "Order cancelled", "This listing was sold through a different order.", s.id);
       }
@@ -89,14 +93,26 @@ async function completeOrder(order, actorId) {
     );
     commissionRow = commission.rows[0];
 
+    // Buyer-paid fee: Ghayarak's money was (or will be) collected from the
+    // BUYER, so the settlement row is already 'paid' if the fee payment
+    // landed, otherwise 'owed' until the DPAY webhook marks it paid. The
+    // seller owes nothing. Legacy seller-fee orders keep the old flow.
+    const buyerFee = feeIsBuyerPaid(order);
+    const feePaid = buyerFee
+      ? (await client.query("select 1 from payments where kind = 'protection' and ref_id = $1 and status = 'paid' limit 1", [order.id])).rows.length > 0
+      : false;
     const settlement = await client.query(
-      `insert into settlements (order_id, seller_commission_id, seller_id, shop_id, commission_amount, status)
-       values ($1,$2,$3,$4,$5,'owed') returning *`,
-      [order.id, commissionRow.id, order.seller_id, order.shop_id, commissionRow.commission_amount]
+      `insert into settlements (order_id, seller_commission_id, seller_id, shop_id, commission_amount, status, paid_at)
+       values ($1,$2,$3,$4,$5,$6,$7) returning *`,
+      [order.id, commissionRow.id, order.seller_id, order.shop_id, commissionRow.commission_amount, feePaid ? "paid" : "owed", feePaid ? new Date() : null]
     );
     settlementRow = settlement.rows[0];
 
-    await notify(client, order.seller_id, "order_completed", "Order completed — commission due", order.id, order.id);
+    await notify(
+      client, order.seller_id, "order_completed",
+      buyerFee ? "Order completed" : "Order completed — commission due",
+      order.id, order.id
+    );
 
     await client.query("COMMIT");
   } catch (e) {
@@ -110,6 +126,14 @@ async function completeOrder(order, actorId) {
   // transaction: a DPAY outage shouldn't roll back the completion or the
   // settlement record — it should just leave the settlement at 'owed' for
   // manual follow-up (see GET /admin/settlements).
+  if (feeIsBuyerPaid(order)) {
+    // Nothing to bill the seller. If the buyer still hasn't paid the fee,
+    // make sure an invoice exists for them (idempotent) — the settlement
+    // stays 'owed' until the DPAY webhook marks it paid.
+    if (settlementRow.status !== "paid") await ensureProtectionInvoice(order);
+    return { order: order_result.rows[0], settlement: settlementRow };
+  }
+
   try {
     const seller = await query("select * from users where id = $1", [order.seller_id]);
     const invoice = await createInvoice({
@@ -139,6 +163,7 @@ router.get("/", requireAuth, async (req, res) => {
   const column = role === "seller" ? "seller_id" : "buyer_id";
   const { rows } = await query(
     `select o.*,
+            exists (select 1 from payments pp where pp.kind = 'protection' and pp.ref_id = o.id and pp.status = 'paid') as protection_paid,
             coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
             b.name as buyer_name, b.contact as buyer_contact,
             s.name as seller_name, s.contact as seller_contact
@@ -197,7 +222,7 @@ router.get("/my-impact", requireAuth, async (req, res) => {
     query(
       `select count(*) as completed,
               coalesce(sum(part_price), 0) as sales_value,
-              coalesce(sum(commission_amount), 0) as commission
+              coalesce(sum(commission_amount) filter (where fee_payer = 'seller'), 0) as commission
        from orders where seller_id = $1 and status = 'completed' and completed_at >= date_trunc('month', now())`,
       [me]
     ),
@@ -326,6 +351,7 @@ router.get("/reviews/:userId", async (req, res) => {
 router.get("/:id", requireAuth, async (req, res) => {
   const { rows } = await query(
     `select o.*,
+            exists (select 1 from payments pp where pp.kind = 'protection' and pp.ref_id = o.id and pp.status = 'paid') as protection_paid,
             coalesce(l.title, pr.make || ' ' || pr.model || ' — ' || pr.part_description) as listing_title,
             po.can_source, po.sourcing_days,
             b.name as buyer_name, b.contact as buyer_contact,
@@ -412,8 +438,11 @@ router.post("/", requireAuth, rateLimit("order_create", { max: 30, windowMinutes
   }
 
   const deliveryFee = deliveryMethod === "delivery" ? DELIVERY_FLAT : 0;
-  const protectionFee = includeProtection && listing.protected_deal ? Math.round(listing.price * PROTECTION_PCT * 100) / 100 : 0;
-  const commissionAmount = Math.round(listing.price * (COMMISSION_PCT / 100) * 100) / 100;
+  // Ghayarak's fee: charged to the buyer on top of the listed price on every
+  // order (500 -> 25 -> buyer total 525). The seller keeps the full 500.
+  // commission_amount mirrors it so admin revenue totals stay correct.
+  const protectionFee = computeFee(listing.price);
+  const commissionAmount = protectionFee;
   // Rough placeholder estimate until real courier integration exists —
   // pickup has no transit time, delivery gets a flat 2-day estimate.
   const estimatedDeliveryAt = deliveryMethod === "delivery" ? new Date(Date.now() + 2 * 86400000) : null;
@@ -426,10 +455,10 @@ router.post("/", requireAuth, rateLimit("order_create", { max: 30, windowMinutes
       `insert into orders
         (listing_id, buyer_id, seller_id, shop_id, part_price, delivery_fee, protection_fee,
          commission_pct, commission_amount, payment_method, payment_category, payment_method_detail, delivery_method,
-         delivery_address, delivery_notes, estimated_delivery_at, reservation_code)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`,
+         delivery_address, delivery_notes, estimated_delivery_at, reservation_code, fee_payer)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'buyer') returning *`,
       [listingId, req.user.id, listing.seller_id, listing.shop_id, listing.price, deliveryFee, protectionFee,
-       COMMISSION_PCT, commissionAmount, paymentMethod, paymentCategory, paymentMethodDetail || null, deliveryMethod,
+       FEE_PCT, commissionAmount, paymentMethod, paymentCategory, paymentMethodDetail || null, deliveryMethod,
        deliveryAddress || null, deliveryNotes || null, estimatedDeliveryAt, reservationCode]
     );
     const o = order.rows[0];
@@ -443,7 +472,11 @@ router.post("/", requireAuth, rateLimit("order_create", { max: 30, windowMinutes
     }
     await notify(client, listing.seller_id, "new_order", "New order", `Order ${o.id} for ${listing.title}`, o.id);
     await client.query("COMMIT");
-    res.status(201).json({ order: o });
+    // After COMMIT and never throws: a DPAY outage must not undo an order
+    // that already exists. status 'unavailable' => buyer retries via
+    // POST /orders/:id/protection-invoice.
+    const protectionInvoice = await ensureProtectionInvoice(o);
+    res.status(201).json({ order: o, protectionInvoice });
   } catch (e) {
     await client.query("ROLLBACK");
     // Postgres error code 23505 = unique_violation. This is the double-tap
@@ -477,6 +510,9 @@ router.post("/:id/accept", requireAuth, async (req, res) => {
   if (!order) return;
   if (order.seller_id !== req.user.id) return res.status(403).json({ error: "Only the seller can accept this order." });
   if (order.status !== "pending") return res.status(400).json({ error: `Order is '${order.status}', can't accept.` });
+  if (feeGateEnabled() && feeIsBuyerPaid(order) && !(await isFeePaid(order.id))) {
+    return res.status(402).json({ error: "The buyer hasn't paid the protection fee yet.", code: "fee_unpaid" });
+  }
 
   const client = await pool.connect();
   try {
@@ -538,6 +574,8 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
     await logStatus(client, req.params.id, order.status, "cancelled", req.user.id, req.body.reason || null);
     const notifyTarget = actor === "seller" ? order.buyer_id : order.seller_id;
     await notify(client, notifyTarget, "order_cancelled", "Order cancelled", order.id, order.id);
+    // If the buyer already paid the protection fee, queue its refund for an admin.
+    await queueFeeRefundIfPaid(client, req.params.id, req.user.id, `order cancelled by ${actor}`);
 
     if (order.listing_id) {
       const listing = await client.query("select * from listings where id = $1", [order.listing_id]);
@@ -702,6 +740,9 @@ router.post("/:id/redeem-code", requireAuth, async (req, res) => {
   if (order.payment_method !== "reserve_at_shop") return res.status(400).json({ error: "This order isn't a shop reservation." });
   if (!["pending", "accepted"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}', can't redeem.` });
   if (order.reservation_code !== code.trim().toUpperCase()) return res.status(400).json({ error: "That code doesn't match this order." });
+  if (feeGateEnabled() && feeIsBuyerPaid(order) && !(await isFeePaid(order.id))) {
+    return res.status(402).json({ error: "The buyer hasn't paid the protection fee yet.", code: "fee_unpaid" });
+  }
 
   const result = await completeOrder(order, req.user.id);
   res.json(result);
@@ -712,6 +753,12 @@ router.post("/:id/dispute", requireAuth, rateLimit("dispute_create", { max: 10, 
   const order = await getOrderOr404(req, res);
   if (!order) return;
   if (order.buyer_id !== req.user.id) return res.status(403).json({ error: "Only the buyer can report a problem." });
+  // A problem can only be reported once the seller has committed to the
+  // order (not while pending/sourcing), and not twice or after cancellation.
+  const DISPUTABLE = ["accepted", "preparing", "ready_for_pickup", "out_for_delivery", "collected", "delivered", "completed"];
+  if (!DISPUTABLE.includes(order.status)) {
+    return res.status(400).json({ error: `Order is '${order.status}', a problem can't be reported at this stage.` });
+  }
 
   const client = await pool.connect();
   try {
@@ -742,6 +789,18 @@ router.post("/:id/dispute", requireAuth, rateLimit("dispute_create", { max: 10, 
   } finally {
     client.release();
   }
+});
+
+// Buyer asks for (or re-opens) the payment link for the protection fee —
+// used when DPAY was down at order time, or the buyer closed the payment
+// page. Returns the existing open invoice if there is one.
+router.post("/:id/protection-invoice", requireAuth, rateLimit("fee_invoice", { max: 20, windowMinutes: 60, keyFn: (req) => req.user.id }), async (req, res) => {
+  const order = await getOrderOr404(req, res);
+  if (!order) return;
+  if (order.buyer_id !== req.user.id) return res.status(403).json({ error: "Only the buyer can pay this fee." });
+  if (["cancelled", "refunded"].includes(order.status)) return res.status(400).json({ error: `Order is '${order.status}'.` });
+  const protectionInvoice = await ensureProtectionInvoice(order);
+  res.json({ protectionInvoice });
 });
 
 // Buyer submits proof of a manual bank transfer. This does not itself
