@@ -729,6 +729,15 @@ router.post("/disputes/:id/resolve", moderationOnly, async (req, res) => {
         [o.id, refund.rows[0].id, o.part_price, `Dispute ${req.params.id} resolved as refund_buyer`, req.user.id]
       );
       await query("insert into revenue_events (source, amount, ref_id) values ('refund', $1, $2)", [o.part_price, o.id]);
+
+      // The buyer won, so Ghayarak's 5% protection fee goes back too (if it
+      // was paid). Queued as a normal refund request for an admin to action.
+      try {
+        const { queueFeeRefundIfPaid } = require("../lib/protectionFee");
+        await queueFeeRefundIfPaid({ query }, o.id, before.rows[0].reporter_id, "dispute resolved in the buyer's favour");
+      } catch (e) {
+        console.error("Fee refund queue failed for dispute", req.params.id, e);
+      }
     }
   }
 
